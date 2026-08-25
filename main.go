@@ -33,7 +33,7 @@ const (
 	roleGuest        = "guest"
 	roleModerator    = "moderator"
 	adminTokenHeader = "X-Relay-Key"
-	serverVersion    = "v0.3.2"
+	serverVersion    = "v0.3.3"
 
 	maxWSMessageBytes    = 1024 * 1024
 	maxSignalTypeLen     = 64
@@ -167,6 +167,42 @@ type room struct {
 	muteAll   bool
 	muteAllow map[string]bool
 	muted     map[string]bool
+}
+
+func (r *room) moderatorKeyValue() string {
+	if r == nil {
+		return ""
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.moderatorKey
+}
+
+func (r *room) setModeratorKeyIfEmpty(key string) {
+	if r == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+	r.mu.Lock()
+	if r.moderatorKey == "" {
+		r.moderatorKey = key
+	}
+	r.mu.Unlock()
+}
+
+func (r *room) replaceModeratorKey(key string) []*peer {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	r.moderatorKey = key
+	moderators := make([]*peer, 0)
+	for _, p := range r.peers {
+		if p != nil && !p.closed.Load() && p.getRole() == roleModerator {
+			moderators = append(moderators, p)
+		}
+	}
+	r.mu.Unlock()
+	return moderators
 }
 
 func (r *room) snapshotPeersLocked() []peerSnapshot {
@@ -968,12 +1004,62 @@ func (s *server) openRoom(name string) (string, error) {
 
 	s.mu.Lock()
 	s.openRooms[name] = storedKey
-	if r := s.rooms[name]; r != nil {
-		r.moderatorKey = storedKey
-	}
+	liveRoom := s.rooms[name]
 	s.mu.Unlock()
+	if liveRoom != nil {
+		liveRoom.replaceModeratorKey(storedKey)
+	}
 
 	return storedKey, nil
+}
+
+func (s *server) rotateModeratorKey(name string) (string, error) {
+	name, err := validateRequiredSignalValue("room", name, maxRoomNameLen)
+	if err != nil {
+		return "", err
+	}
+
+	s.mu.RLock()
+	_, open := s.openRooms[name]
+	s.mu.RUnlock()
+	if !open {
+		return "", fmt.Errorf("room is not open")
+	}
+
+	newKey := mustGenerateModeratorKey()
+	updateQuery := fmt.Sprintf(
+		"UPDATE %s SET %s = ? WHERE %s = ?",
+		quoteSQLIdentifier(s.dbTable),
+		quoteSQLIdentifier(s.dbKeyColumn),
+		quoteSQLIdentifier(s.dbRoomColumn),
+	)
+	result, err := s.db.Exec(updateQuery, newKey, name)
+	if err != nil {
+		return "", err
+	}
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		if err != nil {
+			return "", err
+		}
+		return "", fmt.Errorf("room is not open")
+	}
+
+	s.mu.Lock()
+	if _, stillOpen := s.openRooms[name]; !stillOpen {
+		s.mu.Unlock()
+		return "", fmt.Errorf("room is not open")
+	}
+	s.openRooms[name] = newKey
+	liveRoom := s.rooms[name]
+	s.mu.Unlock()
+
+	moderators := liveRoom.replaceModeratorKey(newKey)
+	for _, moderator := range moderators {
+		s.detachPeer(moderator, "moderator link rotated by admin")
+	}
+
+	log.Printf("moderator key rotated: room=%s revokedModerators=%d", name, len(moderators))
+	return newKey, nil
 }
 
 func (s *server) closeRoom(name string) error {
@@ -1114,6 +1200,37 @@ func (s *server) adminOpenRoomHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (s *server) adminRotateModeratorKeyHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdminToken(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	moderatorKey, err := s.rotateModeratorKey(name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(openRoomResponse{
+		Room:         name,
+		ModeratorKey: moderatorKey,
+		GuestLinkData: linkDataSnapshot{
+			Room:     name,
+			DeepLink: buildClientDeepLink(url.Values{"room": []string{name}}),
+		},
+		ModLinkData: linkDataSnapshot{
+			Room:         name,
+			ModeratorKey: moderatorKey,
+			DeepLink:     buildClientDeepLink(url.Values{"room": []string{name}, "modKey": []string{moderatorKey}}),
+		},
+	})
 }
 
 func (s *server) adminCloseRoomHandler(w http.ResponseWriter, r *http.Request) {
@@ -1322,9 +1439,7 @@ func (s *server) getOrCreateRoom(name string, moderatorKey string) *room {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if r, ok := s.rooms[name]; ok {
-		if r.moderatorKey == "" && moderatorKey != "" {
-			r.moderatorKey = moderatorKey
-		}
+		r.setModeratorKeyIfEmpty(moderatorKey)
 		return r
 	}
 	r := &room{
@@ -2117,7 +2232,7 @@ func (s *server) requireModeratorCommand(ctx context.Context, p *peer, msg signa
 		p.write(ctx, signalMsg{Type: "error", Error: "moderator role required"})
 		return false
 	}
-	if !isModeratorKeyValid(msg.ModKey, r.moderatorKey) {
+	if !isModeratorKeyValid(msg.ModKey, r.moderatorKeyValue()) {
 		p.write(ctx, signalMsg{Type: "error", Error: "valid modKey required"})
 		return false
 	}
@@ -3509,6 +3624,7 @@ func main() {
 		publicMux.HandleFunc("/admin/open-room", s.adminOpenRoomHandler)
 		publicMux.HandleFunc("/admin/close-room", s.adminCloseRoomHandler)
 		publicMux.HandleFunc("/admin/open-rooms", s.adminOpenRoomsHandler)
+		publicMux.HandleFunc("/admin/rotate-moderator-key", s.adminRotateModeratorKeyHandler)
 	}
 
 	adminMux := http.NewServeMux()
@@ -3516,6 +3632,7 @@ func main() {
 	adminMux.HandleFunc("/admin/open-room", s.adminOpenRoomHandler)
 	adminMux.HandleFunc("/admin/close-room", s.adminCloseRoomHandler)
 	adminMux.HandleFunc("/admin/open-rooms", s.adminOpenRoomsHandler)
+	adminMux.HandleFunc("/admin/rotate-moderator-key", s.adminRotateModeratorKeyHandler)
 
 	adminServer := &http.Server{
 		Addr:              *adminAddr,
