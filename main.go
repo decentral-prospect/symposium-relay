@@ -143,6 +143,9 @@ type server struct {
 	config webrtc.Configuration
 	db     *sql.DB
 
+	allowLoopbackICECandidates bool
+	allowPrivateICECandidates  bool
+
 	adminToken    string
 	publicBaseURL string
 	instanceName  string
@@ -798,7 +801,7 @@ func cloneRTPPacket(pkt *rtp.Packet) *rtp.Packet {
 	return &out
 }
 
-func newServer(iceURLs []string, includeLoopback bool, nat1to1IPs []string, publicIP string, dbPath string, dbTable string, dbRoomColumn string, dbKeyColumn string, adminToken string, publicBaseURL string, instanceName string, iceUDPPortMin uint16, iceUDPPortMax uint16) *server {
+func newServer(iceURLs []string, includeLoopback bool, allowPrivateICE bool, nat1to1IPs []string, publicIP string, dbPath string, dbTable string, dbRoomColumn string, dbKeyColumn string, adminToken string, publicBaseURL string, instanceName string, iceUDPPortMin uint16, iceUDPPortMax uint16) *server {
 	adminToken = strings.TrimSpace(adminToken)
 	if adminToken == "" {
 		log.Fatalf("admin token is required")
@@ -918,17 +921,19 @@ func newServer(iceURLs []string, includeLoopback bool, nat1to1IPs []string, publ
 	}
 
 	return &server{
-		api:           api,
-		config:        cfg,
-		db:            db,
-		adminToken:    adminToken,
-		publicBaseURL: publicBaseURL,
-		instanceName:  instanceName,
-		dbTable:       dbTable,
-		dbRoomColumn:  dbRoomColumn,
-		dbKeyColumn:   dbKeyColumn,
-		rooms:         make(map[string]*room),
-		openRooms:     openRooms,
+		api:                        api,
+		config:                     cfg,
+		db:                         db,
+		allowLoopbackICECandidates: includeLoopback,
+		allowPrivateICECandidates:  allowPrivateICE,
+		adminToken:                 adminToken,
+		publicBaseURL:              publicBaseURL,
+		instanceName:               instanceName,
+		dbTable:                    dbTable,
+		dbRoomColumn:               dbRoomColumn,
+		dbKeyColumn:                dbKeyColumn,
+		rooms:                      make(map[string]*room),
+		openRooms:                  openRooms,
 	}
 }
 
@@ -1687,6 +1692,7 @@ func (s *server) handleJoin(ctx context.Context, p *peer, msg signalMsg) {
 	p.joinedAt = time.Now()
 
 	stalePeers := s.findStalePeersByReconnectToken(r, p)
+	resumeState := reconnectResumeStateForPeers(r, stalePeers)
 	for _, old := range stalePeers {
 		log.Printf("replace stale peer: room=%s old=%s new=%s username=%s", r.name, old.id, p.id, p.username)
 		s.detachPeer(old, "replaced by reconnect")
@@ -1696,7 +1702,8 @@ func (s *server) handleJoin(ctx context.Context, p *peer, msg signalMsg) {
 		p.reconnectToken = mustGenerateReconnectToken()
 	}
 
-	if role != roleModerator {
+	resumeApprovedGuest := role == roleGuest && resumeState.approvedGuest
+	if role != roleModerator && !resumeApprovedGuest {
 		r.mu.Lock()
 		p.setRoomPendingRole(r, true, roleGuest)
 		r.pending[p.id] = p
@@ -1726,7 +1733,16 @@ func (s *server) handleJoin(ctx context.Context, p *peer, msg signalMsg) {
 
 	r.mu.Lock()
 	r.peers[p.id] = p
-	p.setRoomPendingRole(r, false, roleModerator)
+	p.setRoomPendingRole(r, false, role)
+	if resumeApprovedGuest {
+		if resumeState.explicitlyMuted {
+			r.muted[p.id] = true
+		}
+		if resumeState.muteAllowed {
+			r.muteAllow[p.id] = true
+		}
+		p.handRaised.Store(resumeState.handRaised)
+	}
 	peersSnapshot := r.snapshotPeersLocked()
 	tracksSnapshot := r.snapshotTracksLocked()
 	pendingSnapshot := r.snapshotPendingLocked()
@@ -1737,14 +1753,14 @@ func (s *server) handleJoin(ctx context.Context, p *peer, msg signalMsg) {
 	videoEnabled := p.videoEnabled.Load()
 	r.mu.Unlock()
 
-	log.Printf("join moderator: room=%s peer=%s", r.name, p.id)
+	log.Printf("join active: room=%s peer=%s role=%s resumed=%t", r.name, p.id, role, resumeApprovedGuest)
 	p.write(ctx, signalMsg{
 		Type:           "join",
 		PeerID:         p.id,
 		Room:           r.name,
 		Username:       p.username,
 		ReconnectToken: p.reconnectToken,
-		Role:           roleModerator,
+		Role:           role,
 		Peers:          peersSnapshot,
 		Tracks:         tracksSnapshot,
 		Pending:        pendingSnapshot,
@@ -1762,7 +1778,7 @@ func (s *server) handleJoin(ctx context.Context, p *peer, msg signalMsg) {
 		Type:         "peer-joined",
 		PeerID:       p.id,
 		Username:     p.username,
-		Role:         roleModerator,
+		Role:         role,
 		Muted:        muted,
 		CanSpeak:     canSpeak,
 		HandRaised:   handRaised,
@@ -1812,6 +1828,42 @@ func (s *server) findStalePeersByReconnectToken(r *room, incoming *peer) []*peer
 		}
 	}
 	return stale
+}
+
+type reconnectResumeState struct {
+	approvedGuest   bool
+	explicitlyMuted bool
+	muteAllowed     bool
+	handRaised      bool
+}
+
+func reconnectResumeStateForPeers(r *room, stalePeers []*peer) reconnectResumeState {
+	var state reconnectResumeState
+	if r == nil {
+		return state
+	}
+
+	for _, old := range stalePeers {
+		if old == nil || old.closed.Load() {
+			continue
+		}
+		oldRoom, oldRole, active := old.activeRoomRole()
+		if !active || oldRoom != r || oldRole != roleGuest {
+			continue
+		}
+
+		r.mu.RLock()
+		isCurrent := r.peers[old.id] == old
+		if isCurrent {
+			state.approvedGuest = true
+			state.explicitlyMuted = state.explicitlyMuted || r.muted[old.id]
+			state.muteAllowed = state.muteAllowed || r.muteAllow[old.id]
+			state.handRaised = state.handRaised || old.handRaised.Load()
+		}
+		r.mu.RUnlock()
+	}
+
+	return state
 }
 
 func (s *server) handleMediaState(ctx context.Context, p *peer, msg signalMsg) {
@@ -2325,7 +2377,7 @@ func (s *server) handlePublishOffer(ctx context.Context, p *peer, msg signalMsg)
 		local = &answer
 	}
 
-	sendLocal := sanitizedDescription(local)
+	sendLocal := s.sanitizedDescription(local)
 
 	p.pubReady.Store(true)
 	p.write(ctx, signalMsg{
@@ -2686,7 +2738,7 @@ func (s *server) bindPublishHandlers(ctx context.Context, p *peer, pc *webrtc.Pe
 		if strings.TrimSpace(json.Candidate) == "" {
 			return
 		}
-		if !shouldSendICECandidate(json.Candidate) {
+		if !s.shouldSendICECandidate(json.Candidate) {
 			return
 		}
 		log.Printf("peer %s publish ICE candidate: mid=%v summary=%s", p.id, json.SDPMid, iceCandidateSummary(json.Candidate))
@@ -2717,7 +2769,7 @@ func (s *server) bindSubscribeHandlers(ctx context.Context, p *peer, pc *webrtc.
 		if strings.TrimSpace(json.Candidate) == "" {
 			return
 		}
-		if !shouldSendICECandidate(json.Candidate) {
+		if !s.shouldSendICECandidate(json.Candidate) {
 			return
 		}
 		log.Printf("peer %s subscribe ICE candidate: generation=%d mid=%v summary=%s", p.id, generation, json.SDPMid, iceCandidateSummary(json.Candidate))
@@ -2763,7 +2815,7 @@ func (s *server) onPeerConnectionState(p *peer, target string, pc *webrtc.PeerCo
 		p.stopDisconnectTimer(target)
 
 	case webrtc.PeerConnectionStateDisconnected:
-		p.startDisconnectTimer(target, 10*time.Second, func() {
+		p.startDisconnectTimer(target, 20*time.Second, func() {
 			if p.closed.Load() {
 				return
 			}
@@ -2785,7 +2837,7 @@ func (s *server) onPeerConnectionState(p *peer, target string, pc *webrtc.PeerCo
 		})
 
 	case webrtc.PeerConnectionStateFailed:
-		p.startDisconnectTimer(target, 5*time.Second, func() {
+		p.startDisconnectTimer(target, 12*time.Second, func() {
 			if p.closed.Load() {
 				return
 			}
@@ -3146,7 +3198,7 @@ func (s *server) flushSubNegotiation(p *peer) {
 		local = &offer
 	}
 
-	sendLocal := sanitizedDescription(local)
+	sendLocal := s.sanitizedDescription(local)
 
 	log.Printf("send subscribeOffer peer=%s generation=%d revision=%d", p.id, generation, revision)
 	p.write(safeContext(p), signalMsg{
@@ -3172,7 +3224,7 @@ func (s *server) detachPeer(p *peer, reason string) {
 		p.videoEnabled.Store(false)
 
 		if p.ws != nil {
-			_ = p.ws.Close(websocket.StatusNormalClosure, reason)
+			_ = p.ws.Close(peerCloseStatusForReason(reason), reason)
 		}
 
 		oldPubPC := p.swapPubPC(nil)
@@ -3260,6 +3312,16 @@ func (s *server) detachPeer(p *peer, reason string) {
 		s.broadcastLobbyState(room)
 		p.clearRoom()
 	})
+}
+
+func peerCloseStatusForReason(reason string) websocket.StatusCode {
+	normalized := strings.ToLower(strings.TrimSpace(reason))
+	if strings.HasSuffix(normalized, " disconnected") ||
+		strings.HasSuffix(normalized, " failed") ||
+		strings.Contains(normalized, " pc create failed") {
+		return websocket.StatusTryAgainLater
+	}
+	return websocket.StatusNormalClosure
 }
 
 func (s *server) broadcastRoom(r *room, msg signalMsg, skip *peer) {
@@ -3387,6 +3449,14 @@ func iceCandidateSummary(candidate string) string {
 }
 
 func shouldSendICECandidate(candidate string) bool {
+	return shouldSendICECandidateWithPolicy(candidate, false, false)
+}
+
+func shouldSendICECandidateWithLoopback(candidate string, allowLoopback bool) bool {
+	return shouldSendICECandidateWithPolicy(candidate, allowLoopback, false)
+}
+
+func shouldSendICECandidateWithPolicy(candidate string, allowLoopback bool, allowPrivate bool) bool {
 	candidate = strings.TrimSpace(candidate)
 	if candidate == "" {
 		return false
@@ -3416,7 +3486,23 @@ func shouldSendICECandidate(candidate string) bool {
 		return false
 	}
 
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+	if ip.IsLoopback() {
+		if allowLoopback {
+			return true
+		}
+		log.Printf("drop loopback ICE candidate summary=%s", iceCandidateSummary(candidate))
+		return false
+	}
+
+	if ip.IsPrivate() {
+		if allowPrivate {
+			return true
+		}
+		log.Printf("drop private ICE candidate summary=%s", iceCandidateSummary(candidate))
+		return false
+	}
+
+	if ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
 		log.Printf("drop private/unusable ICE candidate summary=%s", iceCandidateSummary(candidate))
 		return false
 	}
@@ -3424,7 +3510,15 @@ func shouldSendICECandidate(candidate string) bool {
 	return true
 }
 
-func sanitizeSDPICECandidates(sdp string) string {
+func (s *server) shouldSendICECandidate(candidate string) bool {
+	return shouldSendICECandidateWithPolicy(
+		candidate,
+		s != nil && s.allowLoopbackICECandidates,
+		s != nil && s.allowPrivateICECandidates,
+	)
+}
+
+func sanitizeSDPICECandidatesWithPolicy(sdp string, candidateAllowed func(string) bool) string {
 	normalized := strings.ReplaceAll(sdp, "\r\n", "\n")
 	lines := strings.Split(normalized, "\n")
 
@@ -3436,7 +3530,7 @@ func sanitizeSDPICECandidates(sdp string) string {
 		if strings.HasPrefix(line, "a=candidate:") {
 			candidate := strings.TrimPrefix(line, "a=")
 
-			if !shouldSendICECandidate(candidate) {
+			if candidateAllowed == nil || !candidateAllowed(candidate) {
 				log.Printf("drop SDP ICE candidate summary=%s", iceCandidateSummary(candidate))
 				continue
 			}
@@ -3448,14 +3542,26 @@ func sanitizeSDPICECandidates(sdp string) string {
 	return strings.Join(out, "\r\n")
 }
 
-func sanitizedDescription(desc *webrtc.SessionDescription) *webrtc.SessionDescription {
+func sanitizeSDPICECandidates(sdp string) string {
+	return sanitizeSDPICECandidatesWithPolicy(sdp, shouldSendICECandidate)
+}
+
+func sanitizedDescriptionWithPolicy(desc *webrtc.SessionDescription, candidateAllowed func(string) bool) *webrtc.SessionDescription {
 	if desc == nil {
 		return nil
 	}
 
 	cp := *desc
-	cp.SDP = sanitizeSDPICECandidates(cp.SDP)
+	cp.SDP = sanitizeSDPICECandidatesWithPolicy(cp.SDP, candidateAllowed)
 	return &cp
+}
+
+func sanitizedDescription(desc *webrtc.SessionDescription) *webrtc.SessionDescription {
+	return sanitizedDescriptionWithPolicy(desc, shouldSendICECandidate)
+}
+
+func (s *server) sanitizedDescription(desc *webrtc.SessionDescription) *webrtc.SessionDescription {
+	return sanitizedDescriptionWithPolicy(desc, s.shouldSendICECandidate)
 }
 
 func safeContext(p *peer) context.Context {
@@ -3552,6 +3658,7 @@ func main() {
 		iceUDPPortMinArg  = flag.Uint("ice-udp-port-min", uint(envUint16OrDefault("RELAY_ICE_UDP_PORT_MIN", 32768)), "minimum UDP port for WebRTC ICE media")
 		iceUDPPortMaxArg  = flag.Uint("ice-udp-port-max", uint(envUint16OrDefault("RELAY_ICE_UDP_PORT_MAX", 60999)), "maximum UDP port for WebRTC ICE media")
 		includeLoop       = flag.Bool("loopback", false, "include loopback host candidates")
+		allowPrivateICE   = flag.Bool("allow-private-ice", false, "advertise private host candidates; use only for LAN or test environments")
 		nat1to1CSV        = flag.String("nat1to1", "", "comma-separated external IPs for 1:1 NAT mapping")
 	)
 	flag.Parse()
@@ -3606,10 +3713,13 @@ func main() {
 	if publicBaseURL != "" {
 		log.Printf("Public base URL: %s", publicBaseURL)
 	}
+	if *allowPrivateICE {
+		log.Printf("WARNING: private ICE candidates are enabled for LAN/test use")
+	}
 	log.Printf("ICE UDP port range: %d-%d/udp", iceUDPPortMin, iceUDPPortMax)
 	log.Printf("Admin API token configured: yes")
 
-	s := newServer(iceURLs, *includeLoop, natIPs, publicIP, dbPath, *dbTableArg, *dbRoomColumnArg, *dbKeyColumnArg, adminToken, publicBaseURL, *instanceNameArg, iceUDPPortMin, iceUDPPortMax)
+	s := newServer(iceURLs, *includeLoop, *allowPrivateICE, natIPs, publicIP, dbPath, *dbTableArg, *dbRoomColumnArg, *dbKeyColumnArg, adminToken, publicBaseURL, *instanceNameArg, iceUDPPortMin, iceUDPPortMax)
 
 	publicMux := http.NewServeMux()
 	publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
