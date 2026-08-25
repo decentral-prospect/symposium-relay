@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 func newModeratorRotationTestServer(t *testing.T, roomName string, moderatorKey string) (*server, *room) {
@@ -153,5 +155,68 @@ func TestAdminRotateModeratorKeyHandlerRequiresAdminAndReturnsNewKey(t *testing.
 	}
 	if response.ModLinkData.ModeratorKey != response.ModeratorKey {
 		t.Fatal("moderator link data does not contain the rotated key")
+	}
+}
+
+func TestPeerCloseStatusForReason(t *testing.T) {
+	tests := []struct {
+		name   string
+		reason string
+		want   websocket.StatusCode
+	}{
+		{name: "publish disconnected", reason: "publish disconnected", want: websocket.StatusTryAgainLater},
+		{name: "subscribe failed", reason: "subscribe failed", want: websocket.StatusTryAgainLater},
+		{name: "pc create failed", reason: "subscribe pc create failed after lobby approval", want: websocket.StatusTryAgainLater},
+		{name: "room closed", reason: "room closed by admin", want: websocket.StatusNormalClosure},
+		{name: "replaced reconnect", reason: "replaced by reconnect", want: websocket.StatusNormalClosure},
+		{name: "client websocket closed", reason: "ws closed", want: websocket.StatusNormalClosure},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := peerCloseStatusForReason(tt.reason); got != tt.want {
+				t.Fatalf("peerCloseStatusForReason(%q) = %d, want %d", tt.reason, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReconnectResumeStatePreservesApprovedGuestModeration(t *testing.T) {
+	r := &room{
+		name:      "resume-room",
+		peers:     make(map[string]*peer),
+		pending:   make(map[string]*peer),
+		pubs:      make(map[string]*publication),
+		muteAllow: make(map[string]bool),
+		muted:     make(map[string]bool),
+	}
+	approved := &peer{
+		id:          "approved-guest",
+		role:        roleGuest,
+		room:        r,
+		subs:        make(map[string]*subscription),
+		discoTimers: make(map[string]*time.Timer),
+	}
+	approved.handRaised.Store(true)
+	r.peers[approved.id] = approved
+	r.muted[approved.id] = true
+	r.muteAllow[approved.id] = true
+
+	state := reconnectResumeStateForPeers(r, []*peer{approved})
+	if !state.approvedGuest || !state.explicitlyMuted || !state.muteAllowed || !state.handRaised {
+		t.Fatalf("approved guest resume state was not preserved: %+v", state)
+	}
+
+	pending := &peer{
+		id:          "pending-guest",
+		role:        roleGuest,
+		room:        r,
+		pending:     true,
+		subs:        make(map[string]*subscription),
+		discoTimers: make(map[string]*time.Timer),
+	}
+	r.pending[pending.id] = pending
+	if got := reconnectResumeStateForPeers(r, []*peer{pending}); got.approvedGuest {
+		t.Fatalf("pending guest unexpectedly resumed as approved: %+v", got)
 	}
 }
