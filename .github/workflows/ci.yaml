@@ -19,7 +19,8 @@ concurrency:
 
 jobs:
   test:
-    name: Checks
+    # Keep this name in sync with the required status check in the main ruleset.
+    name: Test and build
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
