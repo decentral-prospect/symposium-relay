@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# CI never needs to write to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # github.com/mattn/go-sqlite3 requires CGO.
+      CGO_ENABLED: "1"
+
+      # Do not silently download a different Go toolchain.
+      # setup-go installs the version declared in go.mod.
+      GOTOOLCHAIN: local
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          files="$(gofmt -l .)"
+
+          if [[ -n "$files" ]]; then
+            echo "The following files are not formatted with gofmt:"
+            printf '%s\n' "$files"
+            exit 1
+          fi
+
+      - name: Verify module metadata
+        run: |
+          go mod tidy -diff
+          go mod verify
+
+      - name: Run go vet
+        run: |
+          go vet -mod=readonly ./...
+
+      - name: Run tests
+        run: |
+          go test \
+            -mod=readonly \
+            -vet=off \
+            -count=1 \
+            -timeout=10m \
+            ./...
+
+      - name: Build relay
+        run: |
+          mkdir -p "$RUNNER_TEMP/build"
+
+          go build \
+            -mod=readonly \
+            -trimpath \
+            -buildvcs=true \
+            -o "$RUNNER_TEMP/build/symposium-server-linux-amd64" \
+            .
+
+      - name: Verify build artifact
+        run: |
+          file "$RUNNER_TEMP/build/symposium-server-linux-amd64"
+          sha256sum "$RUNNER_TEMP/build/symposium-server-linux-amd64"
