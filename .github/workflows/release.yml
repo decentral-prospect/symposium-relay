@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "*.*.*"
 
 # A tag can produce at most one release build. There is intentionally no
 # workflow_dispatch entry: official binaries are built only from pushed tags.
@@ -15,7 +15,6 @@ permissions:
   contents: write
   id-token: write
   attestations: write
-  artifact-metadata: write
 
 jobs:
   release:
@@ -34,8 +33,8 @@ jobs:
       - name: Validate release tag
         shell: bash
         run: |
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Release tags must use SemVer, for example v1.2.3 or v1.2.3-rc.1."
+          if [[ ! "$GITHUB_REF_NAME" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tags must use SemVer, for example 1.2.3 or 1.2.3-rc.1."
             exit 1
           fi
 
@@ -81,22 +80,36 @@ jobs:
         with:
           subject-path: dist/${{ env.ARTIFACT }}
 
-      - name: Publish GitHub release
+      - name: Create draft GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          args=(
-            "$GITHUB_REF_NAME"
-            "dist/${ARTIFACT}#Linux amd64"
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --generate-notes \
+            --title "Symposium Server ${GITHUB_REF_NAME}" \
+            --draft
+
+      - name: Upload release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "dist/${ARTIFACT}#Linux amd64" \
             "dist/${ARTIFACT}.sha256#SHA-256 checksum"
-            --verify-tag
-            --generate-notes
-            --title "Symposium Server ${GITHUB_REF_NAME}"
-          )
 
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
-            args+=(--prerelease)
+            gh release edit "$GITHUB_REF_NAME" \
+              --draft=false \
+              --prerelease
+          else
+            gh release edit "$GITHUB_REF_NAME" \
+              --draft=false
           fi
-
-          gh release create "${args[@]}"
