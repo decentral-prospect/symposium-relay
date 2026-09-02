@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# A tag can produce at most one release build. There is intentionally no
+# workflow_dispatch entry: official binaries are built only from pushed tags.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  release:
+    name: Build and publish Linux amd64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    env:
+      ARTIFACT: symposium-server-linux-amd64
+      CGO_ENABLED: "1"
+      GOOS: linux
+      GOARCH: amd64
+      GOTOOLCHAIN: local
+
+    steps:
+      - name: Validate release tag
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tags must use SemVer, for example v1.2.3 or v1.2.3-rc.1."
+            exit 1
+          fi
+
+      - name: Checkout tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test tagged source
+        run: |
+          go mod verify
+          go test -mod=readonly -count=1 -timeout=10m ./...
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          go build \
+            -mod=readonly \
+            -trimpath \
+            -buildvcs=true \
+            -ldflags="-s -w -X main.serverVersion=${GITHUB_REF_NAME}" \
+            -o "dist/${ARTIFACT}" \
+            .
+
+      - name: Verify binary and create checksum
+        shell: bash
+        run: |
+          file "dist/${ARTIFACT}"
+          file "dist/${ARTIFACT}" | grep -q "ELF 64-bit.*x86-64"
+          cd dist
+          sha256sum "$ARTIFACT" > "${ARTIFACT}.sha256"
+          sha256sum --check "${ARTIFACT}.sha256"
+
+      - name: Attest GitHub-built binary
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/${{ env.ARTIFACT }}
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=(
+            "$GITHUB_REF_NAME"
+            "dist/${ARTIFACT}#Linux amd64"
+            "dist/${ARTIFACT}.sha256#SHA-256 checksum"
+            --verify-tag
+            --generate-notes
+            --title "Symposium Server ${GITHUB_REF_NAME}"
+          )
+
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+
+          gh release create "${args[@]}"

@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   test:
-    name: Test and build
+    name: Checks
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -72,7 +72,7 @@ jobs:
             -timeout=10m \
             ./...
 
-      - name: Build relay
+      - name: Check development build
         run: |
           mkdir -p "$RUNNER_TEMP/build"
 
@@ -80,10 +80,7 @@ jobs:
             -mod=readonly \
             -trimpath \
             -buildvcs=true \
-            -o "$RUNNER_TEMP/build/symposium-server-linux-amd64" \
+            -o "$RUNNER_TEMP/build/symposium-server-development" \
             .
 
-      - name: Verify build artifact
-        run: |
-          file "$RUNNER_TEMP/build/symposium-server-linux-amd64"
-          sha256sum "$RUNNER_TEMP/build/symposium-server-linux-amd64"
+          file "$RUNNER_TEMP/build/symposium-server-development"
