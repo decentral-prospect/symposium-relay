@@ -66,19 +66,42 @@ jobs:
             -o "dist/${ARTIFACT}" \
             .
 
-      - name: Verify binary and create checksum
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          file: dist/${{ env.ARTIFACT }}
+          format: cyclonedx-json
+          output-file: dist/${{ env.ARTIFACT }}.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Verify binary and create checksums
         shell: bash
         run: |
           file "dist/${ARTIFACT}"
           file "dist/${ARTIFACT}" | grep -q "ELF 64-bit.*x86-64"
+
+          test -s "dist/${ARTIFACT}.cdx.json"
+
           cd dist
-          sha256sum "$ARTIFACT" > "${ARTIFACT}.sha256"
-          sha256sum --check "${ARTIFACT}.sha256"
+
+          sha256sum \
+            "$ARTIFACT" \
+            "${ARTIFACT}.cdx.json" \
+            > SHA256SUMS
+
+          sha256sum --check SHA256SUMS
 
       - name: Attest GitHub-built binary
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: dist/${{ env.ARTIFACT }}
+
+      - name: Attest CycloneDX SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/${{ env.ARTIFACT }}
+          sbom-path: dist/${{ env.ARTIFACT }}.cdx.json
 
       - name: Create draft GitHub release
         shell: bash
@@ -98,7 +121,8 @@ jobs:
         run: |
           gh release upload "$GITHUB_REF_NAME" \
             "dist/${ARTIFACT}#Linux amd64" \
-            "dist/${ARTIFACT}.sha256#SHA-256 checksum"
+            "dist/${ARTIFACT}.cdx.json#CycloneDX SBOM" \
+            "dist/SHA256SUMS#SHA-256 checksums"
 
       - name: Publish release
         shell: bash
