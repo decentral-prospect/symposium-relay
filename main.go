@@ -33,7 +33,6 @@ const (
 	roleGuest        = "guest"
 	roleModerator    = "moderator"
 	adminTokenHeader = "X-Relay-Key"
-	serverVersion    = "v0.3.3"
 
 	maxWSMessageBytes    = 1024 * 1024
 	maxSignalTypeLen     = 64
@@ -48,6 +47,10 @@ const (
 	maxICECandidateLen   = 4096
 	maxSDPMidLen         = 64
 )
+
+// serverVersion is replaced with the pushed tag by the release workflow.
+// Local and ordinary CI builds are deliberately identifiable as non-release builds.
+var serverVersion = "development"
 
 type signalMsg struct {
 	Type string `json:"type"`
