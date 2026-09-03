@@ -29,7 +29,7 @@ require (
 	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
 	github.com/pion/rtcp v1.2.16
-	github.com/pion/rtp v1.10.1
+	github.com/pion/rtp v1.10.5
 	github.com/pion/sctp v1.9.5 // indirect
 	github.com/pion/sdp/v3 v3.0.18 // indirect
 	golang.org/x/crypto v0.50.0
