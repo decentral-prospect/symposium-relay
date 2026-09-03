@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
+	stdlog "log"
 	"net"
 	"net/http"
 	"net/url"
@@ -51,6 +51,25 @@ const (
 // serverVersion is replaced with the pushed tag by the release workflow.
 // Local and ordinary CI builds are deliberately identifiable as non-release builds.
 var serverVersion = "development"
+
+// serverLogger deliberately drops routine activity messages so the relay does
+// not create a server-side journal of rooms, peers, or media activity. Fatal
+// startup errors are still written to stderr because the process cannot run.
+type serverLogger struct {
+	fatal *stdlog.Logger
+}
+
+func (l *serverLogger) Printf(_ string, _ ...any) {}
+
+func (l *serverLogger) Fatalf(format string, args ...any) {
+	l.fatal.Fatalf(format, args...)
+}
+
+func (l *serverLogger) SetFlags(flags int) {
+	l.fatal.SetFlags(flags)
+}
+
+var log = &serverLogger{fatal: stdlog.New(os.Stderr, "", stdlog.LstdFlags)}
 
 type signalMsg struct {
 	Type string `json:"type"`
@@ -3666,7 +3685,7 @@ func main() {
 	)
 	flag.Parse()
 
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
+	log.SetFlags(stdlog.LstdFlags | stdlog.Lmicroseconds | stdlog.Lshortfile)
 
 	if *iceUDPPortMinArg == 0 || *iceUDPPortMinArg > 65535 || *iceUDPPortMaxArg == 0 || *iceUDPPortMaxArg > 65535 || *iceUDPPortMaxArg < *iceUDPPortMinArg {
 		log.Fatalf("invalid ICE UDP port range: %d-%d", *iceUDPPortMinArg, *iceUDPPortMaxArg)
