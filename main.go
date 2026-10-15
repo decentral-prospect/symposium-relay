@@ -12,8 +12,8 @@ import (
 	stdlog "log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,20 +37,43 @@ const (
 	maxWSMessageBytes    = 1024 * 1024
 	maxSignalTypeLen     = 64
 	maxRoomNameLen       = 128
+	maxRoomInstanceLen   = 64
 	maxUsernameLen       = 128
 	maxClientIDLen       = 128
 	maxModKeyLen         = 256
+	maxVersionLen        = 64
 	maxReconnectTokenLen = 128
 	maxPeerIDLen         = 128
 	maxReasonLen         = 512
 	maxSDPSizeBytes      = 1024 * 1024
 	maxICECandidateLen   = 4096
 	maxSDPMidLen         = 64
+
+	defaultMaxActivePeers                    = 250
+	defaultMaxPendingLobbyPeers              = 500
+	defaultPendingICECandidatesPerPeer       = 64
+	defaultPendingICEBytesPerPeer      int64 = 256 * 1024
+	defaultPendingICEBytesTotal        int64 = 16 * 1024 * 1024
+	defaultJoinRatePerMinute                 = 12
+	defaultMaxConcurrentJoins                = 16
+	defaultMaxPreJoinConnections             = 512
+	defaultMaxPreJoinConnectionsPerIP        = 32
+	defaultPreJoinTimeout                    = 15 * time.Second
+	defaultStateChangesPerSecond             = 8.0
+	defaultStateChangeBurst                  = 12.0
+	lobbySnapshotMinInterval                 = time.Second
+)
+
+const (
+	capacitySlotNone int32 = iota
+	capacitySlotPending
+	capacitySlotActive
 )
 
 // serverVersion is replaced with the pushed tag by the release workflow.
 // Local and ordinary CI builds are deliberately identifiable as non-release builds.
-var serverVersion = "development"
+var serverVersion = "0.3.4"
+var canonicalVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$`)
 
 // serverLogger deliberately drops routine activity messages so the relay does
 // not create a server-side journal of rooms, peers, or media activity. Fatal
@@ -74,11 +97,14 @@ var log = &serverLogger{fatal: stdlog.New(os.Stderr, "", stdlog.LstdFlags)}
 type signalMsg struct {
 	Type string `json:"type"`
 
-	Room           string `json:"room,omitempty"`
-	PeerID         string `json:"peerId,omitempty"`
-	Username       string `json:"username,omitempty"`
-	ClientID       string `json:"clientId,omitempty"`
-	ReconnectToken string `json:"reconnectToken,omitempty"`
+	Room            string `json:"room,omitempty"`
+	RoomInstance    string `json:"roomInstance,omitempty"`
+	PeerID          string `json:"peerId,omitempty"`
+	Username        string `json:"username,omitempty"`
+	ClientID        string `json:"clientId,omitempty"`
+	ReconnectToken  string `json:"reconnectToken,omitempty"`
+	ClientVersion   string `json:"clientVersion,omitempty"`
+	RequiredVersion string `json:"requiredVersion,omitempty"`
 
 	ModKey       string            `json:"modKey,omitempty"`
 	Role         string            `json:"role,omitempty"`
@@ -88,6 +114,7 @@ type signalMsg struct {
 	Muted        bool              `json:"muted,omitempty"`
 	CanSpeak     bool              `json:"canSpeak,omitempty"`
 	Pending      []pendingSnapshot `json:"pending,omitempty"`
+	JoinedAt     int64             `json:"joinedAt,omitempty"`
 
 	HandRaised bool `json:"handRaised,omitempty"`
 
@@ -112,6 +139,7 @@ type signalMsg struct {
 	Seq    int64          `json:"seq,omitempty"`
 	SentAt int64          `json:"sentAt,omitempty"`
 
+	Code  string `json:"code,omitempty"`
 	Error string `json:"error,omitempty"`
 }
 
@@ -142,22 +170,22 @@ type trackSnapshot struct {
 }
 
 type openRoomResponse struct {
-	Room          string           `json:"room"`
-	ModeratorKey  string           `json:"moderator_key"`
-	GuestLinkData linkDataSnapshot `json:"guestLinkData"`
-	ModLinkData   linkDataSnapshot `json:"moderatorLinkData"`
+	Room                 string `json:"room"`
+	RoomInstance         string `json:"roomInstance"`
+	ModeratorKey         string `json:"moderator_key"`
+	RequiredVersion      string `json:"requiredVersion"`
+	MuteAllByDefault     bool   `json:"muteAllByDefault"`
+	AdmitWithoutApproval bool   `json:"admitWithoutApproval"`
+}
+
+type roomSettings struct {
+	MuteAllByDefault     bool
+	AdmitWithoutApproval bool
 }
 
 type versionResponse struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
-}
-
-type linkDataSnapshot struct {
-	Room         string `json:"room"`
-	ModeratorKey string `json:"moderator_key,omitempty"`
-	HTTPRedirect string `json:"httpRedirect,omitempty"`
-	DeepLink     string `json:"deepLink,omitempty"`
 }
 
 type server struct {
@@ -169,19 +197,290 @@ type server struct {
 	allowPrivateICECandidates  bool
 
 	adminToken    string
-	publicBaseURL string
 	instanceName  string
 	dbTable       string
 	dbRoomColumn  string
 	dbKeyColumn   string
+	moderatorKeys *moderatorKeyCipher
 
-	mu        sync.RWMutex
-	rooms     map[string]*room
-	openRooms map[string]string
+	mu            sync.RWMutex
+	rooms         map[string]*room
+	openRooms     map[string]string
+	roomInstances map[string]string
+	roomVersions  map[string]string
+	settings      map[string]roomSettings
+
+	limits relayLimits
+
+	capacityMu        sync.Mutex
+	activePeers       int
+	pendingLobbyPeers int
+	joinSlots         chan struct{}
+
+	preJoinMu    sync.Mutex
+	preJoinTotal int
+	preJoinByIP  map[string]int
+
+	pendingICEBytes atomic.Int64
+}
+
+type relayLimits struct {
+	MaxActivePeers              int
+	MaxPendingLobbyPeers        int
+	PendingICECandidatesPerPeer int
+	PendingICEBytesPerPeer      int64
+	PendingICEBytesTotal        int64
+	JoinRatePerMinute           int
+	MaxConcurrentJoins          int
+	MaxPreJoinConnections       int
+	MaxPreJoinConnectionsPerIP  int
+	PreJoinTimeout              time.Duration
+}
+
+func defaultRelayLimits() relayLimits {
+	return relayLimits{
+		MaxActivePeers:              defaultMaxActivePeers,
+		MaxPendingLobbyPeers:        defaultMaxPendingLobbyPeers,
+		PendingICECandidatesPerPeer: defaultPendingICECandidatesPerPeer,
+		PendingICEBytesPerPeer:      defaultPendingICEBytesPerPeer,
+		PendingICEBytesTotal:        defaultPendingICEBytesTotal,
+		JoinRatePerMinute:           defaultJoinRatePerMinute,
+		MaxConcurrentJoins:          defaultMaxConcurrentJoins,
+		MaxPreJoinConnections:       defaultMaxPreJoinConnections,
+		MaxPreJoinConnectionsPerIP:  defaultMaxPreJoinConnectionsPerIP,
+		PreJoinTimeout:              defaultPreJoinTimeout,
+	}
+}
+
+func (s *server) effectiveLimits() relayLimits {
+	if s == nil {
+		return defaultRelayLimits()
+	}
+	limits := s.limits
+	defaults := defaultRelayLimits()
+	if limits.MaxActivePeers <= 0 {
+		limits.MaxActivePeers = defaults.MaxActivePeers
+	}
+	if limits.MaxPendingLobbyPeers <= 0 {
+		limits.MaxPendingLobbyPeers = defaults.MaxPendingLobbyPeers
+	}
+	if limits.PendingICECandidatesPerPeer <= 0 {
+		limits.PendingICECandidatesPerPeer = defaults.PendingICECandidatesPerPeer
+	}
+	if limits.PendingICEBytesPerPeer <= 0 {
+		limits.PendingICEBytesPerPeer = defaults.PendingICEBytesPerPeer
+	}
+	if limits.PendingICEBytesTotal <= 0 {
+		limits.PendingICEBytesTotal = defaults.PendingICEBytesTotal
+	}
+	if limits.JoinRatePerMinute <= 0 {
+		limits.JoinRatePerMinute = defaults.JoinRatePerMinute
+	}
+	if limits.MaxConcurrentJoins <= 0 {
+		limits.MaxConcurrentJoins = defaults.MaxConcurrentJoins
+	}
+	if limits.MaxPreJoinConnections <= 0 {
+		limits.MaxPreJoinConnections = defaults.MaxPreJoinConnections
+	}
+	if limits.MaxPreJoinConnectionsPerIP <= 0 {
+		limits.MaxPreJoinConnectionsPerIP = defaults.MaxPreJoinConnectionsPerIP
+	}
+	if limits.PreJoinTimeout <= 0 {
+		limits.PreJoinTimeout = defaults.PreJoinTimeout
+	}
+	return limits
+}
+
+func normalizedRemoteIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
+	if err == nil {
+		if ip := net.ParseIP(host); ip != nil {
+			return ip.String()
+		}
+		return strings.ToLower(host)
+	}
+	if ip := net.ParseIP(strings.TrimSpace(remoteAddr)); ip != nil {
+		return ip.String()
+	}
+	return "unknown"
+}
+
+func (s *server) reservePreJoin(remoteIP string) bool {
+	if s == nil {
+		return false
+	}
+	limits := s.effectiveLimits()
+	s.preJoinMu.Lock()
+	defer s.preJoinMu.Unlock()
+	if s.preJoinByIP == nil {
+		s.preJoinByIP = make(map[string]int)
+	}
+	if s.preJoinTotal >= limits.MaxPreJoinConnections || s.preJoinByIP[remoteIP] >= limits.MaxPreJoinConnectionsPerIP {
+		return false
+	}
+	s.preJoinTotal++
+	s.preJoinByIP[remoteIP]++
+	return true
+}
+
+func (s *server) releasePreJoinIP(remoteIP string) {
+	if s == nil {
+		return
+	}
+	s.preJoinMu.Lock()
+	if s.preJoinTotal > 0 {
+		s.preJoinTotal--
+	}
+	if count := s.preJoinByIP[remoteIP]; count <= 1 {
+		delete(s.preJoinByIP, remoteIP)
+	} else {
+		s.preJoinByIP[remoteIP] = count - 1
+	}
+	s.preJoinMu.Unlock()
+}
+
+func (s *server) releasePreJoin(p *peer) {
+	if p != nil && p.preJoinReserved.CompareAndSwap(true, false) {
+		s.releasePreJoinIP(p.preJoinIP)
+	}
+}
+
+func (s *server) acquireJoinSlot() bool {
+	if s == nil {
+		return false
+	}
+	s.capacityMu.Lock()
+	if s.joinSlots == nil {
+		s.joinSlots = make(chan struct{}, s.effectiveLimits().MaxConcurrentJoins)
+	}
+	joinSlots := s.joinSlots
+	s.capacityMu.Unlock()
+	select {
+	case joinSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *server) releaseJoinSlot() {
+	if s == nil {
+		return
+	}
+	s.capacityMu.Lock()
+	joinSlots := s.joinSlots
+	s.capacityMu.Unlock()
+	if joinSlots == nil {
+		return
+	}
+	select {
+	case <-joinSlots:
+	default:
+	}
+}
+
+func (s *server) reservePeerCapacity(p *peer, slot int32) bool {
+	if s == nil || p == nil || slot == capacitySlotNone {
+		return false
+	}
+	limits := s.effectiveLimits()
+	s.capacityMu.Lock()
+	defer s.capacityMu.Unlock()
+	if p.capacitySlot.Load() != capacitySlotNone {
+		return false
+	}
+	switch slot {
+	case capacitySlotPending:
+		if s.pendingLobbyPeers >= limits.MaxPendingLobbyPeers {
+			return false
+		}
+		s.pendingLobbyPeers++
+	case capacitySlotActive:
+		if s.activePeers >= limits.MaxActivePeers {
+			return false
+		}
+		s.activePeers++
+	default:
+		return false
+	}
+	p.capacitySlot.Store(slot)
+	return true
+}
+
+func (s *server) promotePeerCapacity(p *peer) bool {
+	if s == nil || p == nil {
+		return false
+	}
+	limits := s.effectiveLimits()
+	s.capacityMu.Lock()
+	defer s.capacityMu.Unlock()
+	if p.capacitySlot.Load() != capacitySlotPending || s.activePeers >= limits.MaxActivePeers {
+		return false
+	}
+	if s.pendingLobbyPeers > 0 {
+		s.pendingLobbyPeers--
+	}
+	s.activePeers++
+	p.capacitySlot.Store(capacitySlotActive)
+	return true
+}
+
+func (s *server) releasePeerCapacity(p *peer) {
+	if s == nil || p == nil {
+		return
+	}
+	s.capacityMu.Lock()
+	slot := p.capacitySlot.Swap(capacitySlotNone)
+	switch slot {
+	case capacitySlotPending:
+		if s.pendingLobbyPeers > 0 {
+			s.pendingLobbyPeers--
+		}
+	case capacitySlotActive:
+		if s.activePeers > 0 {
+			s.activePeers--
+		}
+	}
+	s.capacityMu.Unlock()
+}
+
+func (p *peer) allowJoinAttempt(limit int, now time.Time) bool {
+	if p == nil || limit <= 0 {
+		return false
+	}
+	cutoff := now.Add(-time.Minute)
+	p.joinMu.Lock()
+	kept := p.joinAttempts[:0]
+	for _, attempt := range p.joinAttempts {
+		if attempt.After(cutoff) {
+			kept = append(kept, attempt)
+		}
+	}
+	p.joinAttempts = kept
+	if len(p.joinAttempts) >= limit {
+		p.joinMu.Unlock()
+		return false
+	}
+	p.joinAttempts = append(p.joinAttempts, now)
+	p.joinMu.Unlock()
+	return true
+}
+
+func (p *peer) stopLobbySnapshotTimer() {
+	if p == nil {
+		return
+	}
+	p.lobbySnapshotMu.Lock()
+	if p.lobbySnapshotTimer != nil {
+		p.lobbySnapshotTimer.Stop()
+		p.lobbySnapshotTimer = nil
+	}
+	p.lobbySnapshotMu.Unlock()
 }
 
 type room struct {
 	name         string
+	instance     string
 	moderatorKey string
 
 	mu      sync.RWMutex
@@ -192,6 +491,18 @@ type room struct {
 	muteAll   bool
 	muteAllow map[string]bool
 	muted     map[string]bool
+
+	admitWithoutApproval bool
+	lobbyRevision        uint64
+}
+
+func (r *room) admitsWithoutApproval() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.admitWithoutApproval
 }
 
 func (r *room) moderatorKeyValue() string {
@@ -338,15 +649,22 @@ type peer struct {
 
 	handRaised atomic.Bool
 
+	stateChangeMu   sync.Mutex
+	stateRateMu     sync.Mutex
+	stateRateTokens float64
+	stateRateLast   time.Time
+
 	audioEnabled atomic.Bool
 	videoEnabled atomic.Bool
 
 	subsMu sync.RWMutex
 	subs   map[string]*subscription
 
-	candMu               sync.Mutex
-	pendingPubCandidates []pendingCandidate
-	pendingSubCandidates []pendingCandidate
+	candMu                sync.Mutex
+	pendingPubCandidates  []pendingCandidate
+	pendingSubCandidates  []pendingCandidate
+	pendingCandidateCount int
+	pendingCandidateBytes int64
 
 	subGeneration atomic.Uint64
 
@@ -361,12 +679,58 @@ type peer struct {
 	discoMu     sync.Mutex
 	discoTimers map[string]*time.Timer
 
+	joinMu          sync.Mutex
+	joinAttempts    []time.Time
+	capacitySlot    atomic.Int32
+	preJoinIP       string
+	preJoinReserved atomic.Bool
+	joinEstablished atomic.Bool
+
+	lobbySnapshotMu    sync.Mutex
+	lobbySnapshotTimer *time.Timer
+	lastLobbySnapshot  time.Time
+
+	writeHook func(any)
+
 	detachOnce sync.Once
 }
 
+func (p *peer) allowBroadcastStateChange(now time.Time) bool {
+	if p == nil {
+		return false
+	}
+	p.stateRateMu.Lock()
+	defer p.stateRateMu.Unlock()
+	if p.stateRateLast.IsZero() {
+		p.stateRateTokens = defaultStateChangeBurst
+		p.stateRateLast = now
+	} else {
+		elapsed := now.Sub(p.stateRateLast).Seconds()
+		if elapsed > 0 {
+			p.stateRateTokens += elapsed * defaultStateChangesPerSecond
+			if p.stateRateTokens > defaultStateChangeBurst {
+				p.stateRateTokens = defaultStateChangeBurst
+			}
+			p.stateRateLast = now
+		}
+	}
+	if p.stateRateTokens < 1 {
+		return false
+	}
+	p.stateRateTokens--
+	return true
+}
+
+func rejectBroadcastStateFlood(ctx context.Context, p *peer) {
+	if p != nil {
+		p.write(ctx, signalMsg{Type: "error", Code: "state-rate-limit", Error: "too many state changes; retry shortly"})
+	}
+}
+
 type pendingCandidate struct {
-	generation uint64
-	candidate  webrtc.ICECandidateInit
+	generation    uint64
+	candidate     webrtc.ICECandidateInit
+	retainedBytes int64
 }
 
 func (p *peer) getRole() string {
@@ -812,24 +1176,28 @@ func cloneRTPPacket(pkt *rtp.Packet) *rtp.Packet {
 	if pkt == nil {
 		return nil
 	}
-	raw, err := pkt.Marshal()
-	if err != nil {
-		return nil
-	}
-	var out rtp.Packet
-	if err := out.Unmarshal(raw); err != nil {
-		return nil
-	}
-	return &out
+	out := pkt.Clone()
+	// RTP extension IDs and MID/RID/TWCC values belong to one negotiated
+	// PeerConnection. Copying the publisher's values into a subscriber's
+	// different extmap can turn an ordinary packet into a bogus RTX packet.
+	// The outgoing transport's interceptors add their own transport metadata;
+	// the encrypted encoded-frame payload is forwarded unchanged.
+	out.Extension = false
+	out.ExtensionProfile = 0
+	out.Extensions = nil
+	return out
 }
 
-func newServer(iceURLs []string, includeLoopback bool, allowPrivateICE bool, nat1to1IPs []string, publicIP string, dbPath string, dbTable string, dbRoomColumn string, dbKeyColumn string, adminToken string, publicBaseURL string, instanceName string, iceUDPPortMin uint16, iceUDPPortMax uint16) *server {
+func newServer(iceURLs []string, includeLoopback bool, allowPrivateICE bool, nat1to1IPs []string, publicIP string, dbPath string, dbTable string, dbRoomColumn string, dbKeyColumn string, adminToken string, instanceName string, iceUDPPortMin uint16, iceUDPPortMax uint16, limits relayLimits, moderatorKeys *moderatorKeyCipher) *server {
+	limits = (&server{limits: limits}).effectiveLimits()
 	adminToken = strings.TrimSpace(adminToken)
 	if adminToken == "" {
 		log.Fatalf("admin token is required")
 	}
+	if moderatorKeys == nil {
+		log.Fatalf("moderator key encryption is required")
+	}
 
-	publicBaseURL = strings.TrimRight(strings.TrimSpace(publicBaseURL), "/")
 	instanceName = strings.TrimSpace(instanceName)
 	if instanceName == "" {
 		log.Fatalf("instance name is required")
@@ -843,6 +1211,11 @@ func newServer(iceURLs []string, includeLoopback bool, allowPrivateICE bool, nat
 	ir := &interceptor.Registry{}
 	if err := webrtc.RegisterDefaultInterceptors(&m, ir); err != nil {
 		log.Fatalf("RegisterDefaultInterceptors: %v", err)
+	}
+	// Each subscriber needs a fresh transport sequence and its own negotiated
+	// extension ID; publisher transport headers are removed before forwarding.
+	if err := webrtc.ConfigureTWCCHeaderExtensionSender(&m, ir); err != nil {
+		log.Fatalf("ConfigureTWCCHeaderExtensionSender: %v", err)
 	}
 
 	se := webrtc.SettingEngine{}
@@ -910,36 +1283,19 @@ func newServer(iceURLs []string, includeLoopback bool, allowPrivateICE bool, nat
 	if err != nil {
 		log.Fatalf("open sqlite: %v", err)
 	}
-	if err := ensureRoomSchema(db, dbTable, dbRoomColumn, dbKeyColumn); err != nil {
-		log.Fatalf("init sqlite schema: %v", err)
-	}
-
 	openRooms := make(map[string]string)
-	rows, err := db.Query(fmt.Sprintf("SELECT %s, %s FROM %s", quoteSQLIdentifier(dbRoomColumn), quoteSQLIdentifier(dbKeyColumn), quoteSQLIdentifier(dbTable)))
+	roomInstances := make(map[string]string)
+	roomVersions := make(map[string]string)
+	settings := make(map[string]roomSettings)
+	records, err := loadAndMigrateRooms(db, dbTable, dbRoomColumn, dbKeyColumn, moderatorKeys)
 	if err != nil {
 		log.Fatalf("load open rooms: %v", err)
 	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var name string
-		var moderatorKey string
-		if err := rows.Scan(&name, &moderatorKey); err != nil {
-			continue
-		}
-		name = strings.TrimSpace(name)
-		moderatorKey = strings.TrimSpace(moderatorKey)
-		if name == "" {
-			continue
-		}
-		if moderatorKey == "" {
-			moderatorKey = mustGenerateModeratorKey()
-			query := fmt.Sprintf("UPDATE %s SET %s = ? WHERE %s = ?", quoteSQLIdentifier(dbTable), quoteSQLIdentifier(dbKeyColumn), quoteSQLIdentifier(dbRoomColumn))
-			if _, err := db.Exec(query, moderatorKey, name); err != nil {
-				log.Fatalf("backfill moderator key for room %q: %v", name, err)
-			}
-		}
-		openRooms[name] = moderatorKey
+	for _, record := range records {
+		openRooms[record.name] = record.moderatorKey
+		roomInstances[record.name] = record.instance
+		roomVersions[record.name] = record.requiredVersion
+		settings[record.name] = record.settings
 	}
 
 	return &server{
@@ -949,13 +1305,19 @@ func newServer(iceURLs []string, includeLoopback bool, allowPrivateICE bool, nat
 		allowLoopbackICECandidates: includeLoopback,
 		allowPrivateICECandidates:  allowPrivateICE,
 		adminToken:                 adminToken,
-		publicBaseURL:              publicBaseURL,
 		instanceName:               instanceName,
 		dbTable:                    dbTable,
 		dbRoomColumn:               dbRoomColumn,
 		dbKeyColumn:                dbKeyColumn,
+		moderatorKeys:              moderatorKeys,
 		rooms:                      make(map[string]*room),
 		openRooms:                  openRooms,
+		roomInstances:              roomInstances,
+		roomVersions:               roomVersions,
+		settings:                   settings,
+		limits:                     limits,
+		joinSlots:                  make(chan struct{}, limits.MaxConcurrentJoins),
+		preJoinByIP:                make(map[string]int),
 	}
 }
 
@@ -973,19 +1335,101 @@ func mustSQLIdentifier(label string, value string) string {
 	return value
 }
 
+func canonicalRequiredVersion(value string) (string, error) {
+	version := strings.TrimSpace(value)
+	if len(version) > maxVersionLen || !canonicalVersionPattern.MatchString(version) {
+		return "", fmt.Errorf("invalid canonical version %q", version)
+	}
+	return version, nil
+}
+
 func quoteSQLIdentifier(value string) string {
+	if strings.IndexByte(value, 0) >= 0 {
+		panic("SQL identifier contains NUL")
+	}
 	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
 }
 
-func ensureRoomSchema(db *sql.DB, table string, roomColumn string, keyColumn string) error {
+type roomSchemaDatabase interface {
+	Exec(string, ...any) (sql.Result, error)
+	Query(string, ...any) (*sql.Rows, error)
+}
+
+func ensureRoomSchema(db roomSchemaDatabase, table string, roomColumn string, keyColumn string) error {
 	query := fmt.Sprintf(
 		"CREATE TABLE IF NOT EXISTS %s (%s TEXT PRIMARY KEY, %s TEXT NOT NULL DEFAULT '')",
 		quoteSQLIdentifier(table),
 		quoteSQLIdentifier(roomColumn),
 		quoteSQLIdentifier(keyColumn),
 	)
-	_, err := db.Exec(query)
-	return err
+	if _, err := db.Exec(query); err != nil {
+		return err
+	}
+
+	columns := []struct {
+		name string
+		ddl  string
+	}{
+		{name: "mute_all_by_default", ddl: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "admit_without_approval", ddl: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "required_version", ddl: "TEXT NOT NULL DEFAULT ''"},
+		{name: "room_instance", ddl: "TEXT NOT NULL DEFAULT ''"},
+	}
+	for _, column := range columns {
+		exists, err := sqliteColumnExists(db, table, column.name)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		if _, err := db.Exec(fmt.Sprintf(
+			"ALTER TABLE %s ADD COLUMN %s %s",
+			quoteSQLIdentifier(table),
+			quoteSQLIdentifier(column.name),
+			column.ddl,
+		)); err != nil {
+			return err
+		}
+	}
+	requiredVersion, err := canonicalRequiredVersion(serverVersion)
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(
+		fmt.Sprintf(
+			"UPDATE %s SET required_version = ? WHERE TRIM(required_version) = ''",
+			quoteSQLIdentifier(table),
+		),
+		requiredVersion,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+func sqliteColumnExists(db roomSchemaDatabase, table string, column string) (bool, error) {
+	rows, err := db.Query("PRAGMA table_info(" + quoteSQLIdentifier(table) + ")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name string
+		var dataType string
+		var notNull int
+		var defaultValue any
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *server) roomModeratorKey(name string) (string, bool) {
@@ -995,49 +1439,319 @@ func (s *server) roomModeratorKey(name string) (string, bool) {
 	return key, ok
 }
 
+func (s *server) roomInstance(name string) (string, bool) {
+	s.mu.RLock()
+	instance, ok := s.roomInstances[name]
+	_, open := s.openRooms[name]
+	s.mu.RUnlock()
+	return instance, ok && open && isValidRoomInstance(instance)
+}
+
+func (s *server) roomRequiredVersion(name string) (string, bool) {
+	s.mu.RLock()
+	version, ok := s.roomVersions[name]
+	_, open := s.openRooms[name]
+	s.mu.RUnlock()
+	if !open {
+		return "", false
+	}
+	if ok && strings.TrimSpace(version) != "" {
+		return version, true
+	}
+	// In-memory servers created by tests or during a legacy transition still
+	// fail closed against the version of the running relay.
+	version, err := canonicalRequiredVersion(serverVersion)
+	if err != nil {
+		return "", false
+	}
+	return version, true
+}
+
+func (s *server) roomJoinRequirements(name string) (moderatorKey string, roomInstance string, requiredVersion string, ok bool) {
+	s.mu.RLock()
+	moderatorKey, open := s.openRooms[name]
+	roomInstance, hasInstance := s.roomInstances[name]
+	requiredVersion = s.roomVersions[name]
+	s.mu.RUnlock()
+	if !open || !hasInstance || !isValidRoomInstance(roomInstance) {
+		return "", "", "", false
+	}
+	if strings.TrimSpace(requiredVersion) == "" {
+		var err error
+		requiredVersion, err = canonicalRequiredVersion(serverVersion)
+		if err != nil {
+			return "", "", "", false
+		}
+	}
+	return moderatorKey, roomInstance, requiredVersion, true
+}
+
+func writeInvalidInvitation(ctx context.Context, p *peer) {
+	if p != nil {
+		p.write(ctx, signalMsg{Type: "error", Code: "invitation-invalid", Error: "invitation is invalid or room is unavailable"})
+	}
+}
+
 func (s *server) openRoom(name string) (string, error) {
+	return s.openRoomWithSettings(name, nil)
+}
+
+func (s *server) roomSettings(name string) roomSettings {
+	s.mu.RLock()
+	settings := s.settings[name]
+	s.mu.RUnlock()
+	return settings
+}
+
+func (s *server) openRoomWithSettings(name string, requested *roomSettings) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "", fmt.Errorf("room name is required")
+	}
+	requiredVersion, err := canonicalRequiredVersion(serverVersion)
+	if err != nil {
+		return "", err
 	}
 
 	moderatorKey, ok := s.roomModeratorKey(name)
 	if !ok || strings.TrimSpace(moderatorKey) == "" {
 		moderatorKey = mustGenerateModeratorKey()
 	}
-
-	insertQuery := fmt.Sprintf("INSERT OR IGNORE INTO %s(%s, %s) VALUES(?, ?)", quoteSQLIdentifier(s.dbTable), quoteSQLIdentifier(s.dbRoomColumn), quoteSQLIdentifier(s.dbKeyColumn))
-	if _, err := s.db.Exec(insertQuery, name, moderatorKey); err != nil {
+	roomInstance, instanceOK := s.roomInstance(name)
+	if !instanceOK {
+		roomInstance = mustGenerateRoomInstance()
+	}
+	storedModeratorKey, err := s.moderatorKeys.seal(name, moderatorKey)
+	if err != nil {
 		return "", err
 	}
-	updateIfEmptyQuery := fmt.Sprintf("UPDATE %s SET %s = CASE WHEN %s = '' THEN ? ELSE %s END WHERE %s = ?", quoteSQLIdentifier(s.dbTable), quoteSQLIdentifier(s.dbKeyColumn), quoteSQLIdentifier(s.dbKeyColumn), quoteSQLIdentifier(s.dbKeyColumn), quoteSQLIdentifier(s.dbRoomColumn))
-	if _, err := s.db.Exec(updateIfEmptyQuery, moderatorKey, name); err != nil {
+
+	settings := roomSettings{}
+	if requested != nil {
+		settings = *requested
+	}
+	insertQuery := fmt.Sprintf(
+		"INSERT OR IGNORE INTO %s(%s, %s, room_instance, required_version, mute_all_by_default, admit_without_approval) VALUES(?, ?, ?, ?, ?, ?)",
+		quoteSQLIdentifier(s.dbTable),
+		quoteSQLIdentifier(s.dbRoomColumn),
+		quoteSQLIdentifier(s.dbKeyColumn),
+	)
+	if _, err := s.db.Exec(
+		insertQuery,
+		name,
+		storedModeratorKey,
+		roomInstance,
+		requiredVersion,
+		boolToSQLite(settings.MuteAllByDefault),
+		boolToSQLite(settings.AdmitWithoutApproval),
+	); err != nil {
 		return "", err
+	}
+	updateIfEmptyQuery := fmt.Sprintf("UPDATE %s SET %s = CASE WHEN %s = '' THEN ? ELSE %s END, room_instance = CASE WHEN TRIM(room_instance) = '' THEN ? ELSE room_instance END, required_version = CASE WHEN TRIM(required_version) = '' THEN ? ELSE required_version END WHERE %s = ?", quoteSQLIdentifier(s.dbTable), quoteSQLIdentifier(s.dbKeyColumn), quoteSQLIdentifier(s.dbKeyColumn), quoteSQLIdentifier(s.dbKeyColumn), quoteSQLIdentifier(s.dbRoomColumn))
+	if _, err := s.db.Exec(updateIfEmptyQuery, storedModeratorKey, roomInstance, requiredVersion, name); err != nil {
+		return "", err
+	}
+	if requested != nil {
+		if err := s.persistRoomSettings(name, settings); err != nil {
+			return "", err
+		}
 	}
 
 	var storedKey string
-	selectQuery := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?", quoteSQLIdentifier(s.dbKeyColumn), quoteSQLIdentifier(s.dbTable), quoteSQLIdentifier(s.dbRoomColumn))
-	if err := s.db.QueryRow(selectQuery, name).Scan(&storedKey); err != nil {
+	var storedRoomInstance string
+	var storedRequiredVersion string
+	var muteAllByDefault int
+	var admitWithoutApproval int
+	selectQuery := fmt.Sprintf(
+		"SELECT %s, room_instance, required_version, mute_all_by_default, admit_without_approval FROM %s WHERE %s = ?",
+		quoteSQLIdentifier(s.dbKeyColumn),
+		quoteSQLIdentifier(s.dbTable),
+		quoteSQLIdentifier(s.dbRoomColumn),
+	)
+	if err := s.db.QueryRow(selectQuery, name).Scan(
+		&storedKey,
+		&storedRoomInstance,
+		&storedRequiredVersion,
+		&muteAllByDefault,
+		&admitWithoutApproval,
+	); err != nil {
 		return "", err
+	}
+	storedRequiredVersion, err = canonicalRequiredVersion(storedRequiredVersion)
+	if err != nil {
+		return "", err
+	}
+	settings = roomSettings{
+		MuteAllByDefault:     muteAllByDefault != 0,
+		AdmitWithoutApproval: admitWithoutApproval != 0,
 	}
 	storedKey = strings.TrimSpace(storedKey)
 	if storedKey == "" {
-		storedKey = moderatorKey
+		storedKey = storedModeratorKey
 		updateQuery := fmt.Sprintf("UPDATE %s SET %s = ? WHERE %s = ?", quoteSQLIdentifier(s.dbTable), quoteSQLIdentifier(s.dbKeyColumn), quoteSQLIdentifier(s.dbRoomColumn))
 		if _, err := s.db.Exec(updateQuery, storedKey, name); err != nil {
 			return "", err
 		}
 	}
+	if strings.HasPrefix(storedKey, encryptedModeratorKeyPrefix) {
+		moderatorKey, err = s.moderatorKeys.open(name, storedKey)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		moderatorKey = storedKey
+		encrypted, encryptErr := s.moderatorKeys.seal(name, moderatorKey)
+		if encryptErr != nil {
+			return "", encryptErr
+		}
+		updateQuery := fmt.Sprintf("UPDATE %s SET %s = ? WHERE %s = ?", quoteSQLIdentifier(s.dbTable), quoteSQLIdentifier(s.dbKeyColumn), quoteSQLIdentifier(s.dbRoomColumn))
+		if _, updateErr := s.db.Exec(updateQuery, encrypted, name); updateErr != nil {
+			return "", updateErr
+		}
+	}
+	storedRoomInstance = strings.TrimSpace(storedRoomInstance)
+	if !isValidRoomInstance(storedRoomInstance) {
+		storedRoomInstance = roomInstance
+		updateQuery := fmt.Sprintf("UPDATE %s SET room_instance = ? WHERE %s = ?", quoteSQLIdentifier(s.dbTable), quoteSQLIdentifier(s.dbRoomColumn))
+		if _, updateErr := s.db.Exec(updateQuery, storedRoomInstance, name); updateErr != nil {
+			return "", updateErr
+		}
+	}
 
 	s.mu.Lock()
-	s.openRooms[name] = storedKey
+	s.openRooms[name] = moderatorKey
+	if s.roomInstances == nil {
+		s.roomInstances = make(map[string]string)
+	}
+	s.roomInstances[name] = storedRoomInstance
+	if s.roomVersions == nil {
+		s.roomVersions = make(map[string]string)
+	}
+	s.roomVersions[name] = storedRequiredVersion
+	if s.settings == nil {
+		s.settings = make(map[string]roomSettings)
+	}
+	s.settings[name] = settings
 	liveRoom := s.rooms[name]
 	s.mu.Unlock()
 	if liveRoom != nil {
-		liveRoom.replaceModeratorKey(storedKey)
+		liveRoom.replaceModeratorKey(moderatorKey)
+		s.applySettingsToLiveRoom(liveRoom, settings)
 	}
 
-	return storedKey, nil
+	return moderatorKey, nil
+}
+
+func boolToSQLite(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func (s *server) persistRoomSettings(name string, settings roomSettings) error {
+	query := fmt.Sprintf(
+		"UPDATE %s SET mute_all_by_default = ?, admit_without_approval = ? WHERE %s = ?",
+		quoteSQLIdentifier(s.dbTable),
+		quoteSQLIdentifier(s.dbRoomColumn),
+	)
+	result, err := s.db.Exec(
+		query,
+		boolToSQLite(settings.MuteAllByDefault),
+		boolToSQLite(settings.AdmitWithoutApproval),
+		name,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return fmt.Errorf("room is not open")
+	}
+	return nil
+}
+
+func (s *server) setRoomSettings(name string, settings roomSettings) error {
+	name, err := validateRequiredSignalValue("room", name, maxRoomNameLen)
+	if err != nil {
+		return err
+	}
+	s.mu.RLock()
+	_, open := s.openRooms[name]
+	s.mu.RUnlock()
+	if !open {
+		return fmt.Errorf("room is not open")
+	}
+	if err := s.persistRoomSettings(name, settings); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	if _, open := s.openRooms[name]; !open {
+		s.mu.Unlock()
+		return fmt.Errorf("room is not open")
+	}
+	if s.settings == nil {
+		s.settings = make(map[string]roomSettings)
+	}
+	s.settings[name] = settings
+	liveRoom := s.rooms[name]
+	s.mu.Unlock()
+
+	if liveRoom != nil {
+		s.applySettingsToLiveRoom(liveRoom, settings)
+	}
+	return nil
+}
+
+func (s *server) applySettingsToLiveRoom(r *room, settings roomSettings) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.admitWithoutApproval = settings.AdmitWithoutApproval
+	r.muteAll = settings.MuteAllByDefault
+	if r.muteAll {
+		r.muteAllow = make(map[string]bool)
+	}
+	peers := make([]*peer, 0, len(r.peers))
+	for _, p := range r.peers {
+		if p != nil && !p.closed.Load() {
+			peers = append(peers, p)
+		}
+	}
+	r.mu.Unlock()
+
+	for _, p := range peers {
+		if p.getRole() == roleModerator {
+			continue
+		}
+		r.mu.RLock()
+		muted, canSpeak := r.muteStateForPeerLocked(p)
+		r.mu.RUnlock()
+		audioEnabled := p.audioEnabled.Load()
+		messageType := "force-unmute"
+		if muted {
+			messageType = "force-mute"
+		}
+		p.write(safeContext(p), signalMsg{
+			Type:         messageType,
+			Room:         r.name,
+			PeerID:       p.id,
+			Muted:        muted,
+			CanSpeak:     canSpeak,
+			MuteAll:      settings.MuteAllByDefault,
+			AudioEnabled: &audioEnabled,
+		})
+	}
+	s.broadcastRoom(r, signalMsg{
+		Type:    "mute-all-state",
+		Room:    r.name,
+		MuteAll: settings.MuteAllByDefault,
+	}, nil)
 }
 
 func (s *server) rotateModeratorKey(name string) (string, error) {
@@ -1054,13 +1768,17 @@ func (s *server) rotateModeratorKey(name string) (string, error) {
 	}
 
 	newKey := mustGenerateModeratorKey()
+	storedKey, err := s.moderatorKeys.seal(name, newKey)
+	if err != nil {
+		return "", err
+	}
 	updateQuery := fmt.Sprintf(
 		"UPDATE %s SET %s = ? WHERE %s = ?",
 		quoteSQLIdentifier(s.dbTable),
 		quoteSQLIdentifier(s.dbKeyColumn),
 		quoteSQLIdentifier(s.dbRoomColumn),
 	)
-	result, err := s.db.Exec(updateQuery, newKey, name)
+	result, err := s.db.Exec(updateQuery, storedKey, name)
 	if err != nil {
 		return "", err
 	}
@@ -1104,6 +1822,9 @@ func (s *server) closeRoom(name string) error {
 
 	s.mu.Lock()
 	delete(s.openRooms, name)
+	delete(s.roomInstances, name)
+	delete(s.roomVersions, name)
+	delete(s.settings, name)
 	r = s.rooms[name]
 	delete(s.rooms, name)
 	s.mu.Unlock()
@@ -1146,18 +1867,19 @@ func (s *server) listOpenRooms() []openRoomResponse {
 	s.mu.RLock()
 	rooms := make([]openRoomResponse, 0, len(s.openRooms))
 	for roomName, moderatorKey := range s.openRooms {
+		roomInstance := s.roomInstances[roomName]
+		settings := s.settings[roomName]
+		requiredVersion := s.roomVersions[roomName]
+		if requiredVersion == "" {
+			requiredVersion = serverVersion
+		}
 		rooms = append(rooms, openRoomResponse{
-			Room:         roomName,
-			ModeratorKey: moderatorKey,
-			GuestLinkData: linkDataSnapshot{
-				Room:     roomName,
-				DeepLink: buildClientDeepLink(url.Values{"room": []string{roomName}}),
-			},
-			ModLinkData: linkDataSnapshot{
-				Room:         roomName,
-				ModeratorKey: moderatorKey,
-				DeepLink:     buildClientDeepLink(url.Values{"room": []string{roomName}, "modKey": []string{moderatorKey}}),
-			},
+			Room:                 roomName,
+			RoomInstance:         roomInstance,
+			ModeratorKey:         moderatorKey,
+			RequiredVersion:      requiredVersion,
+			MuteAllByDefault:     settings.MuteAllByDefault,
+			AdmitWithoutApproval: settings.AdmitWithoutApproval,
 		})
 	}
 	s.mu.RUnlock()
@@ -1197,36 +1919,116 @@ func (s *server) adminOpenRoomHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := strings.TrimSpace(r.URL.Query().Get("name"))
-	moderatorKey, err := s.openRoom(name)
+	var requestedSettings *roomSettings
+	if r.URL.Query().Has("muteAllByDefault") || r.URL.Query().Has("admitWithoutApproval") {
+		settings, err := roomSettingsFromRequest(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		requestedSettings = &settings
+	}
+	moderatorKey, err := s.openRoomWithSettings(name, requestedSettings)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	base := s.publicBaseURL
-	if base == "" {
-		base = requestBaseURL(r)
+	requiredVersion, ok := s.roomRequiredVersion(name)
+	if !ok {
+		http.Error(w, "room is not open", http.StatusBadRequest)
+		return
 	}
-	guestQuery := url.Values{"room": []string{name}}
-	modQuery := url.Values{"room": []string{name}, "modKey": []string{moderatorKey}}
+	roomInstance, ok := s.roomInstance(name)
+	if !ok {
+		http.Error(w, "room is not open", http.StatusBadRequest)
+		return
+	}
+	settings := s.roomSettings(name)
 
 	resp := openRoomResponse{
-		Room:         name,
-		ModeratorKey: moderatorKey,
-		GuestLinkData: linkDataSnapshot{
-			Room:         name,
-			HTTPRedirect: base + "/connect?" + guestQuery.Encode(),
-			DeepLink:     buildClientDeepLink(guestQuery),
-		},
-		ModLinkData: linkDataSnapshot{
-			Room:         name,
-			ModeratorKey: moderatorKey,
-			DeepLink:     buildClientDeepLink(modQuery),
-		},
+		Room:                 name,
+		RoomInstance:         roomInstance,
+		ModeratorKey:         moderatorKey,
+		RequiredVersion:      requiredVersion,
+		MuteAllByDefault:     settings.MuteAllByDefault,
+		AdmitWithoutApproval: settings.AdmitWithoutApproval,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func roomSettingsFromRequest(r *http.Request) (roomSettings, error) {
+	parse := func(name string) (bool, error) {
+		raw := strings.TrimSpace(r.URL.Query().Get(name))
+		if raw == "" {
+			return false, nil
+		}
+		value, err := strconv.ParseBool(raw)
+		if err != nil {
+			return false, fmt.Errorf("invalid %s", name)
+		}
+		return value, nil
+	}
+
+	muteAllByDefault, err := parse("muteAllByDefault")
+	if err != nil {
+		return roomSettings{}, err
+	}
+	admitWithoutApproval, err := parse("admitWithoutApproval")
+	if err != nil {
+		return roomSettings{}, err
+	}
+	return roomSettings{
+		MuteAllByDefault:     muteAllByDefault,
+		AdmitWithoutApproval: admitWithoutApproval,
+	}, nil
+}
+
+func (s *server) adminRoomSettingsHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdminToken(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	settings, err := roomSettingsFromRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.setRoomSettings(name, settings); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	moderatorKey, ok := s.roomModeratorKey(name)
+	if !ok {
+		http.Error(w, "room is not open", http.StatusBadRequest)
+		return
+	}
+	requiredVersion, ok := s.roomRequiredVersion(name)
+	if !ok {
+		http.Error(w, "room is not open", http.StatusBadRequest)
+		return
+	}
+	roomInstance, ok := s.roomInstance(name)
+	if !ok {
+		http.Error(w, "room is not open", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(openRoomResponse{
+		Room:                 name,
+		RoomInstance:         roomInstance,
+		ModeratorKey:         moderatorKey,
+		RequiredVersion:      requiredVersion,
+		MuteAllByDefault:     settings.MuteAllByDefault,
+		AdmitWithoutApproval: settings.AdmitWithoutApproval,
+	})
 }
 
 func (s *server) adminRotateModeratorKeyHandler(w http.ResponseWriter, r *http.Request) {
@@ -1245,18 +2047,24 @@ func (s *server) adminRotateModeratorKeyHandler(w http.ResponseWriter, r *http.R
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	settings := s.roomSettings(name)
+	requiredVersion, ok := s.roomRequiredVersion(name)
+	if !ok {
+		http.Error(w, "room is not open", http.StatusBadRequest)
+		return
+	}
+	roomInstance, ok := s.roomInstance(name)
+	if !ok {
+		http.Error(w, "room is not open", http.StatusBadRequest)
+		return
+	}
 	_ = json.NewEncoder(w).Encode(openRoomResponse{
-		Room:         name,
-		ModeratorKey: moderatorKey,
-		GuestLinkData: linkDataSnapshot{
-			Room:     name,
-			DeepLink: buildClientDeepLink(url.Values{"room": []string{name}}),
-		},
-		ModLinkData: linkDataSnapshot{
-			Room:         name,
-			ModeratorKey: moderatorKey,
-			DeepLink:     buildClientDeepLink(url.Values{"room": []string{name}, "modKey": []string{moderatorKey}}),
-		},
+		Room:                 name,
+		RoomInstance:         roomInstance,
+		ModeratorKey:         moderatorKey,
+		RequiredVersion:      requiredVersion,
+		MuteAllByDefault:     settings.MuteAllByDefault,
+		AdmitWithoutApproval: settings.AdmitWithoutApproval,
 	})
 }
 
@@ -1301,90 +2109,6 @@ func (s *server) adminVersionHandler(w http.ResponseWriter, r *http.Request) {
 		Name:    s.instanceName,
 		Version: serverVersion,
 	})
-}
-
-func (s *server) connectRedirectHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	q, err := validateConnectParams(r.URL.Query())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	http.Redirect(w, r, buildClientDeepLink(q), http.StatusFound)
-}
-
-func validateConnectParams(in url.Values) (url.Values, error) {
-	room := strings.TrimSpace(in.Get("room"))
-	if room == "" {
-		return nil, fmt.Errorf("room is required")
-	}
-	if !isSafeShortValue(room, 128) {
-		return nil, fmt.Errorf("invalid room")
-	}
-
-	out := url.Values{}
-	copyParam := func(name string, maxLen int) error {
-		v := strings.TrimSpace(in.Get(name))
-		if v == "" {
-			return nil
-		}
-		if !isSafeShortValue(v, maxLen) {
-			return fmt.Errorf("invalid %s", name)
-		}
-		out.Set(name, v)
-		return nil
-	}
-
-	out.Set("room", room)
-
-	if err := copyParam("ip", 255); err != nil {
-		return nil, err
-	}
-	if err := copyParam("username", 128); err != nil {
-		return nil, err
-	}
-	if strings.TrimSpace(in.Get("modKey")) != "" {
-		return nil, fmt.Errorf("modKey is not allowed in HTTP redirect links")
-	}
-
-	tlsPin := strings.TrimSpace(in.Get("tlsPin"))
-	if tlsPin != "" {
-		if !strings.HasPrefix(tlsPin, "sha256/") {
-			return nil, fmt.Errorf("invalid tlsPin")
-		}
-		raw := strings.TrimPrefix(tlsPin, "sha256/")
-		if _, err := base64.StdEncoding.DecodeString(raw); err != nil {
-			return nil, fmt.Errorf("invalid tlsPin")
-		}
-		out.Set("tlsPin", tlsPin)
-	}
-
-	return out, nil
-}
-
-func buildClientDeepLink(q url.Values) string {
-	u := url.URL{
-		Scheme:   "symposium",
-		Host:     "connect",
-		RawQuery: q.Encode(),
-	}
-	return u.String()
-}
-
-func requestBaseURL(r *http.Request) string {
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	if xf := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); xf == "http" || xf == "https" {
-		scheme = xf
-	}
-	return strings.TrimRight(scheme+"://"+r.Host, "/")
 }
 
 func isSafeShortValue(v string, maxLen int) bool {
@@ -1462,27 +2186,44 @@ func validateICECandidateInit(c *webrtc.ICECandidateInit) error {
 	return nil
 }
 
-func (s *server) getOrCreateRoom(name string, moderatorKey string) *room {
+func (s *server) getOrCreateRoom(name string, instance string, moderatorKey string) *room {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if r, ok := s.rooms[name]; ok {
 		r.setModeratorKeyIfEmpty(moderatorKey)
 		return r
 	}
+	settings := s.settings[name]
 	r := &room{
-		name:         name,
-		moderatorKey: moderatorKey,
-		peers:        make(map[string]*peer),
-		pending:      make(map[string]*peer),
-		pubs:         make(map[string]*publication),
-		muteAllow:    make(map[string]bool),
-		muted:        make(map[string]bool),
+		name:                 name,
+		instance:             instance,
+		moderatorKey:         moderatorKey,
+		peers:                make(map[string]*peer),
+		pending:              make(map[string]*peer),
+		pubs:                 make(map[string]*publication),
+		muteAll:              settings.MuteAllByDefault,
+		muteAllow:            make(map[string]bool),
+		muted:                make(map[string]bool),
+		admitWithoutApproval: settings.AdmitWithoutApproval,
 	}
 	s.rooms[name] = r
 	return r
 }
 
 func (s *server) wsHandler(w http.ResponseWriter, r *http.Request) {
+	remoteIP := normalizedRemoteIP(r.RemoteAddr)
+	if !s.reservePreJoin(remoteIP) {
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "pre-join connection capacity is currently full", http.StatusTooManyRequests)
+		return
+	}
+	reservedBeforePeer := true
+	defer func() {
+		if reservedBeforePeer {
+			s.releasePreJoinIP(remoteIP)
+		}
+	}()
+
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true,
 	})
@@ -1493,9 +2234,9 @@ func (s *server) wsHandler(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 	conn.SetReadLimit(maxWSMessageBytes)
 
-	remoteIP := r.RemoteAddr
+	remoteAddr := r.RemoteAddr
 	ua := r.UserAgent()
-	log.Printf("WS connected ip=%s ua=%q", remoteIP, ua)
+	log.Printf("WS connected ip=%s ua=%q", remoteAddr, ua)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -1507,7 +2248,17 @@ func (s *server) wsHandler(w http.ResponseWriter, r *http.Request) {
 		signalCtx:   ctx,
 		role:        roleGuest,
 		discoTimers: make(map[string]*time.Timer),
+		preJoinIP:   remoteIP,
 	}
+	p.preJoinReserved.Store(true)
+	reservedBeforePeer = false
+	preJoinTimer := time.AfterFunc(s.effectiveLimits().PreJoinTimeout, func() {
+		if !p.joinEstablished.Load() {
+			s.detachPeer(p, "pre-join timeout")
+		}
+	})
+	defer preJoinTimer.Stop()
+	defer s.releasePreJoin(p)
 
 	for {
 		var msg signalMsg
@@ -1554,10 +2305,7 @@ func (s *server) recreateSubscribePC(ctx context.Context, p *peer, reason string
 	p.stopDisconnectTimer("subscribe")
 	p.stopSubNegotiationTimer()
 	p.subReady.Store(false)
-
-	p.candMu.Lock()
-	p.pendingSubCandidates = nil
-	p.candMu.Unlock()
+	s.clearPendingCandidates(p, "subscribe")
 
 	oldPC := p.swapSubPC(nil)
 
@@ -1617,10 +2365,7 @@ func (s *server) handleSignal(ctx context.Context, p *peer, msg signalMsg) {
 	case "ping":
 		p.write(ctx, signalMsg{Type: "pong", Seq: msg.Seq, SentAt: msg.SentAt})
 	case "pingReport":
-		if msg.RTT >= 0 {
-			p.pingMs.Store(msg.RTT)
-			s.broadcastPeerPing(p)
-		}
+		s.handlePingReport(p, msg.RTT)
 	case "raise-hand":
 		s.handleHandRaised(ctx, p, msg, true)
 	case "lower-hand":
@@ -1635,6 +2380,8 @@ func (s *server) handleSignal(ctx context.Context, p *peer, msg signalMsg) {
 		s.handleLobbyApprove(ctx, p, msg)
 	case "lobby-reject":
 		s.handleLobbyReject(ctx, p, msg)
+	case "lobby-resync":
+		s.handleLobbyResync(ctx, p)
 	case "kick":
 		s.handleKick(ctx, p, msg)
 	case "mute":
@@ -1653,15 +2400,38 @@ func (s *server) handleSignal(ctx context.Context, p *peer, msg signalMsg) {
 }
 
 func (s *server) handleJoin(ctx context.Context, p *peer, msg signalMsg) {
+	limits := s.effectiveLimits()
+	if !p.allowJoinAttempt(limits.JoinRatePerMinute, time.Now()) {
+		p.write(ctx, signalMsg{Type: "error", Code: "join-rate-limit", Error: "too many join attempts on this connection"})
+		return
+	}
+	if !s.acquireJoinSlot() {
+		p.write(ctx, signalMsg{Type: "error", Code: "join-concurrency-limit", Error: "too many joins are being processed; retry shortly"})
+		return
+	}
+	defer s.releaseJoinSlot()
+
 	roomName, err := validateRequiredSignalValue("room", msg.Room, maxRoomNameLen)
 	if err != nil {
 		p.write(ctx, signalMsg{Type: "error", Error: err.Error()})
 		return
 	}
 
-	moderatorKey, ok := s.roomModeratorKey(roomName)
-	if !ok {
-		p.write(ctx, signalMsg{Type: "error", Error: "room is closed"})
+	moderatorKey, roomInstance, requiredVersion, ok := s.roomJoinRequirements(roomName)
+	if !ok || subtle.ConstantTimeCompare([]byte(strings.TrimSpace(msg.RoomInstance)), []byte(roomInstance)) != 1 {
+		writeInvalidInvitation(ctx, p)
+		return
+	}
+	clientVersion, versionErr := canonicalRequiredVersion(msg.ClientVersion)
+	if versionErr != nil || clientVersion != requiredVersion {
+		p.write(ctx, signalMsg{
+			Type:            "error",
+			Code:            "client-version-mismatch",
+			Error:           fmt.Sprintf("client version does not match room version; required %s", requiredVersion),
+			ClientVersion:   strings.TrimSpace(msg.ClientVersion),
+			RequiredVersion: requiredVersion,
+		})
+		s.detachPeer(p, "client version mismatch")
 		return
 	}
 	if p.getRoom() != nil {
@@ -1705,7 +2475,7 @@ func (s *server) handleJoin(ctx context.Context, p *peer, msg signalMsg) {
 		return
 	}
 
-	r := s.getOrCreateRoom(roomName, moderatorKey)
+	r := s.getOrCreateRoom(roomName, roomInstance, moderatorKey)
 	role := roleGuest
 	if isModeratorKeyValid(msg.ModKey, moderatorKey) {
 		role = roleModerator
@@ -1725,13 +2495,19 @@ func (s *server) handleJoin(ctx context.Context, p *peer, msg signalMsg) {
 	}
 
 	resumeApprovedGuest := role == roleGuest && resumeState.approvedGuest
-	if role != roleModerator && !resumeApprovedGuest {
+	if role != roleModerator && !resumeApprovedGuest && !r.admitsWithoutApproval() {
+		if !s.reservePeerCapacity(p, capacitySlotPending) {
+			p.write(ctx, signalMsg{Type: "error", Code: "lobby-capacity", Error: "pending lobby capacity is currently full"})
+			return
+		}
 		r.mu.Lock()
 		p.setRoomPendingRole(r, true, roleGuest)
 		r.pending[p.id] = p
-		pendingSnapshot := r.snapshotPendingLocked()
-		muteAll := r.muteAll
+		r.lobbyRevision++
+		lobbyRevision := r.lobbyRevision
 		r.mu.Unlock()
+		p.joinEstablished.Store(true)
+		s.releasePreJoin(p)
 
 		log.Printf("lobby wait: room=%s peer=%s", r.name, p.id)
 		p.write(ctx, signalMsg{
@@ -1741,14 +2517,17 @@ func (s *server) handleJoin(ctx context.Context, p *peer, msg signalMsg) {
 			Username:       p.username,
 			ReconnectToken: p.reconnectToken,
 			Role:           roleGuest,
-			MuteAll:        muteAll,
-			Pending:        pendingSnapshot,
 		})
-		s.broadcastLobbyState(r)
+		s.broadcastLobbyPeerAdded(r, p, lobbyRevision)
 		return
 	}
 
+	if !s.reservePeerCapacity(p, capacitySlotActive) {
+		p.write(ctx, signalMsg{Type: "error", Code: "conference-capacity", Error: "active conference capacity is currently full"})
+		return
+	}
 	if err := s.ensureSubscribePC(ctx, p); err != nil {
+		s.releasePeerCapacity(p)
 		p.write(ctx, signalMsg{Type: "error", Error: "subscribe pc create failed: " + err.Error()})
 		return
 	}
@@ -1767,25 +2546,38 @@ func (s *server) handleJoin(ctx context.Context, p *peer, msg signalMsg) {
 	}
 	peersSnapshot := r.snapshotPeersLocked()
 	tracksSnapshot := r.snapshotTracksLocked()
-	pendingSnapshot := r.snapshotPendingLocked()
+	var pendingSnapshot []pendingSnapshot
+	if role == roleModerator {
+		pendingSnapshot = r.snapshotPendingLocked()
+	}
+	lobbyRevision := r.lobbyRevision
 	muteAll := r.muteAll
 	muted, canSpeak := r.muteStateForPeerLocked(p)
 	handRaised := p.handRaised.Load()
 	audioEnabled := p.audioEnabled.Load()
 	videoEnabled := p.videoEnabled.Load()
 	r.mu.Unlock()
+	p.joinEstablished.Store(true)
+	s.releasePreJoin(p)
 
 	log.Printf("join active: room=%s peer=%s role=%s resumed=%t", r.name, p.id, role, resumeApprovedGuest)
+	if role == roleModerator {
+		p.lobbySnapshotMu.Lock()
+		p.lastLobbySnapshot = time.Now()
+		p.lobbySnapshotMu.Unlock()
+	}
 	p.write(ctx, signalMsg{
 		Type:           "join",
 		PeerID:         p.id,
 		Room:           r.name,
+		RoomInstance:   r.instance,
 		Username:       p.username,
 		ReconnectToken: p.reconnectToken,
 		Role:           role,
 		Peers:          peersSnapshot,
 		Tracks:         tracksSnapshot,
 		Pending:        pendingSnapshot,
+		Revision:       lobbyRevision,
 		MuteAll:        muteAll,
 		Muted:          muted,
 		CanSpeak:       canSpeak,
@@ -1809,7 +2601,6 @@ func (s *server) handleJoin(ctx context.Context, p *peer, msg signalMsg) {
 		RTT:          p.pingMs.Load(),
 	}, p)
 
-	s.broadcastLobbyState(r)
 }
 
 func isModeratorKeyValid(got string, expected string) bool {
@@ -1897,13 +2688,29 @@ func (s *server) handleMediaState(ctx context.Context, p *peer, msg signalMsg) {
 		return
 	}
 
+	p.stateChangeMu.Lock()
+	currentAudio := p.audioEnabled.Load()
+	currentVideo := p.videoEnabled.Load()
+	nextAudio := currentAudio
+	nextVideo := currentVideo
 	if msg.AudioEnabled != nil {
-		p.audioEnabled.Store(*msg.AudioEnabled)
+		nextAudio = *msg.AudioEnabled
 	}
-
 	if msg.VideoEnabled != nil {
-		p.videoEnabled.Store(*msg.VideoEnabled)
+		nextVideo = *msg.VideoEnabled
 	}
+	if nextAudio == currentAudio && nextVideo == currentVideo {
+		p.stateChangeMu.Unlock()
+		return
+	}
+	if !p.allowBroadcastStateChange(time.Now()) {
+		p.stateChangeMu.Unlock()
+		rejectBroadcastStateFlood(ctx, p)
+		return
+	}
+	p.audioEnabled.Store(nextAudio)
+	p.videoEnabled.Store(nextVideo)
+	p.stateChangeMu.Unlock()
 
 	r.mu.RLock()
 	muted, canSpeak := r.muteStateForPeerLocked(p)
@@ -1928,7 +2735,7 @@ func (s *server) handleMediaState(ctx context.Context, p *peer, msg signalMsg) {
 		HandRaised:   handRaised,
 		AudioEnabled: &audioEnabled,
 		VideoEnabled: &videoEnabled,
-	}, nil)
+	}, p)
 }
 
 func (s *server) handleLobbyApprove(ctx context.Context, moderator *peer, msg signalMsg) {
@@ -1954,7 +2761,14 @@ func (s *server) handleLobbyApprove(ctx context.Context, moderator *peer, msg si
 		moderator.write(ctx, signalMsg{Type: "error", Error: "pending peer not found"})
 		return
 	}
+	if !s.promotePeerCapacity(target) {
+		r.mu.Unlock()
+		moderator.write(ctx, signalMsg{Type: "error", Code: "conference-capacity", Error: "active conference capacity is currently full"})
+		return
+	}
 	delete(r.pending, targetID)
+	r.lobbyRevision++
+	lobbyRevision := r.lobbyRevision
 	target.setRoomPendingRole(r, false, roleGuest)
 	r.peers[target.id] = target
 	muted, canSpeak := r.muteStateForPeerLocked(target)
@@ -2020,7 +2834,7 @@ func (s *server) handleLobbyApprove(ctx context.Context, moderator *peer, msg si
 		RTT:          target.pingMs.Load(),
 	}, target)
 
-	s.broadcastLobbyState(r)
+	s.broadcastLobbyPeerRemoved(r, target, lobbyRevision)
 }
 
 func (s *server) handleLobbyReject(ctx context.Context, moderator *peer, msg signalMsg) {
@@ -2056,7 +2870,6 @@ func (s *server) handleLobbyReject(ctx context.Context, moderator *peer, msg sig
 	log.Printf("lobby reject: room=%s moderator=%s target=%s", r.name, moderator.id, target.id)
 	target.write(safeContext(target), signalMsg{Type: "lobby-reject", Room: r.name, PeerID: target.id, Reason: reason})
 	s.detachPeer(target, reason)
-	s.broadcastLobbyState(r)
 }
 
 func (s *server) handleKick(ctx context.Context, moderator *peer, msg signalMsg) {
@@ -2127,6 +2940,16 @@ func (s *server) handleMutePeer(ctx context.Context, moderator *peer, msg signal
 		moderator.write(ctx, signalMsg{Type: "error", Error: "cannot mute moderator"})
 		return
 	}
+	currentlyMuted := r.isPeerMutedLocked(target)
+	if currentlyMuted == muted {
+		r.mu.Unlock()
+		return
+	}
+	if !moderator.allowBroadcastStateChange(time.Now()) {
+		r.mu.Unlock()
+		rejectBroadcastStateFlood(ctx, moderator)
+		return
+	}
 
 	if muted {
 		r.muted[target.id] = true
@@ -2173,6 +2996,15 @@ func (s *server) handleMuteAll(ctx context.Context, moderator *peer, msg signalM
 	var targets []*peer
 
 	r.mu.Lock()
+	if r.muteAll == enabled {
+		r.mu.Unlock()
+		return
+	}
+	if !moderator.allowBroadcastStateChange(time.Now()) {
+		r.mu.Unlock()
+		rejectBroadcastStateFlood(ctx, moderator)
+		return
+	}
 	r.muteAll = enabled
 	if !enabled {
 		r.muteAllow = make(map[string]bool)
@@ -2199,7 +3031,6 @@ func (s *server) handleMuteAll(ctx context.Context, moderator *peer, msg signalM
 	}
 
 	s.broadcastRoom(r, signalMsg{Type: "mute-all-state", Room: r.name, MuteAll: muteAll}, nil)
-	s.broadcastLobbyState(r)
 }
 
 func (s *server) handleHandRaised(ctx context.Context, p *peer, msg signalMsg, raised bool) {
@@ -2220,7 +3051,16 @@ func (s *server) handleHandRaised(ctx context.Context, p *peer, msg signalMsg, r
 		return
 	}
 
-	p.handRaised.Store(raised)
+	if p.handRaised.Load() == raised {
+		return
+	}
+	if !p.allowBroadcastStateChange(time.Now()) {
+		rejectBroadcastStateFlood(ctx, p)
+		return
+	}
+	if !p.handRaised.CompareAndSwap(!raised, raised) {
+		return
+	}
 	audioEnabled := p.audioEnabled.Load()
 	role := p.getRole()
 
@@ -2234,7 +3074,7 @@ func (s *server) handleHandRaised(ctx context.Context, p *peer, msg signalMsg, r
 		Role:         role,
 		HandRaised:   raised,
 		AudioEnabled: &audioEnabled,
-	}, nil)
+	}, p)
 }
 
 func (s *server) handlePeerHandRaised(ctx context.Context, moderator *peer, msg signalMsg, raised bool) {
@@ -2261,8 +3101,17 @@ func (s *server) handlePeerHandRaised(ctx context.Context, moderator *peer, msg 
 		moderator.write(ctx, signalMsg{Type: "error", Error: "peer not found"})
 		return
 	}
+	if target.handRaised.Load() == raised {
+		return
+	}
+	if !moderator.allowBroadcastStateChange(time.Now()) {
+		rejectBroadcastStateFlood(ctx, moderator)
+		return
+	}
 
-	target.handRaised.Store(raised)
+	if !target.handRaised.CompareAndSwap(!raised, raised) {
+		return
+	}
 	audioEnabled := target.audioEnabled.Load()
 	role := target.getRole()
 
@@ -2313,14 +3162,12 @@ func (s *server) requireModeratorCommand(ctx context.Context, p *peer, msg signa
 	return true
 }
 
-func (s *server) broadcastLobbyState(r *room) {
+func (s *server) lobbyModeratorTargets(r *room) []*peer {
 	if r == nil {
-		return
+		return nil
 	}
 
 	r.mu.RLock()
-	pending := r.snapshotPendingLocked()
-	muteAll := r.muteAll
 	targets := make([]*peer, 0, len(r.peers))
 	for _, p := range r.peers {
 		if p == nil || p.closed.Load() || p.getRole() != roleModerator {
@@ -2329,11 +3176,106 @@ func (s *server) broadcastLobbyState(r *room) {
 		targets = append(targets, p)
 	}
 	r.mu.RUnlock()
+	return targets
+}
 
-	msg := signalMsg{Type: "lobby-state", Room: r.name, Pending: pending, MuteAll: muteAll}
-	for _, p := range targets {
-		p.write(safeContext(p), msg)
+func (s *server) broadcastLobbyEvent(r *room, msg signalMsg) {
+	for _, moderator := range s.lobbyModeratorTargets(r) {
+		moderator.write(safeContext(moderator), msg)
 	}
+}
+
+func (s *server) broadcastLobbyPeerAdded(r *room, pendingPeer *peer, revision uint64) {
+	if r == nil || pendingPeer == nil {
+		return
+	}
+	s.broadcastLobbyEvent(r, signalMsg{
+		Type:     "lobby-peer-added",
+		Room:     r.name,
+		PeerID:   pendingPeer.id,
+		Username: pendingPeer.username,
+		JoinedAt: pendingPeer.joinedAt.UnixMilli(),
+		Revision: revision,
+	})
+}
+
+func (s *server) broadcastLobbyPeerRemoved(r *room, pendingPeer *peer, revision uint64) {
+	if r == nil || pendingPeer == nil {
+		return
+	}
+	s.broadcastLobbyEvent(r, signalMsg{
+		Type:     "lobby-peer-removed",
+		Room:     r.name,
+		PeerID:   pendingPeer.id,
+		Username: pendingPeer.username,
+		Revision: revision,
+	})
+}
+
+func (s *server) broadcastLobbyPeerUpdated(r *room, pendingPeer *peer, revision uint64) {
+	if r == nil || pendingPeer == nil {
+		return
+	}
+	s.broadcastLobbyEvent(r, signalMsg{
+		Type:     "lobby-peer-updated",
+		Room:     r.name,
+		PeerID:   pendingPeer.id,
+		Username: pendingPeer.username,
+		JoinedAt: pendingPeer.joinedAt.UnixMilli(),
+		Revision: revision,
+	})
+}
+
+func (s *server) sendLobbySnapshot(moderator *peer) {
+	r, role, ok := moderator.activeRoomRole()
+	if !ok || role != roleModerator {
+		return
+	}
+	r.mu.RLock()
+	pending := r.snapshotPendingLocked()
+	muteAll := r.muteAll
+	revision := r.lobbyRevision
+	r.mu.RUnlock()
+	moderator.write(safeContext(moderator), signalMsg{
+		Type:     "lobby-state",
+		Room:     r.name,
+		Pending:  pending,
+		MuteAll:  muteAll,
+		Revision: revision,
+	})
+}
+
+func (s *server) scheduleLobbySnapshot(moderator *peer) {
+	if moderator == nil || moderator.closed.Load() {
+		return
+	}
+	moderator.lobbySnapshotMu.Lock()
+	if moderator.lobbySnapshotTimer != nil {
+		moderator.lobbySnapshotMu.Unlock()
+		return
+	}
+	delay := lobbySnapshotMinInterval - time.Since(moderator.lastLobbySnapshot)
+	if delay <= 0 {
+		moderator.lastLobbySnapshot = time.Now()
+		moderator.lobbySnapshotMu.Unlock()
+		s.sendLobbySnapshot(moderator)
+		return
+	}
+	moderator.lobbySnapshotTimer = time.AfterFunc(delay, func() {
+		moderator.lobbySnapshotMu.Lock()
+		moderator.lobbySnapshotTimer = nil
+		moderator.lastLobbySnapshot = time.Now()
+		moderator.lobbySnapshotMu.Unlock()
+		s.sendLobbySnapshot(moderator)
+	})
+	moderator.lobbySnapshotMu.Unlock()
+}
+
+func (s *server) handleLobbyResync(ctx context.Context, moderator *peer) {
+	if !s.requireModerator(ctx, moderator) {
+		return
+	}
+	s.scheduleLobbySnapshot(moderator)
 }
 
 func (s *server) handlePublishOffer(ctx context.Context, p *peer, msg signalMsg) {
@@ -2492,7 +3434,9 @@ func (s *server) handleTrickle(ctx context.Context, p *peer, msg signalMsg) {
 	case "publish":
 		pubPC := p.getPubPC()
 		if pubPC == nil || pubPC.RemoteDescription() == nil || !p.isPubPC(pubPC) {
-			s.queueCandidate(p, "publish", 0, *msg.Candidate)
+			if err := s.queueCandidate(p, "publish", 0, *msg.Candidate); err != nil {
+				p.write(ctx, signalMsg{Type: "error", Code: "pending-ice-limit", Error: err.Error()})
+			}
 			return
 		}
 		if err := pubPC.AddICECandidate(*msg.Candidate); err != nil {
@@ -2507,7 +3451,9 @@ func (s *server) handleTrickle(ctx context.Context, p *peer, msg signalMsg) {
 
 		subPC := p.getSubPC()
 		if subPC == nil || subPC.RemoteDescription() == nil || !p.isSubPC(subPC) || p.subGeneration.Load() != currentGeneration {
-			s.queueCandidate(p, "subscribe", msg.Generation, *msg.Candidate)
+			if err := s.queueCandidate(p, "subscribe", msg.Generation, *msg.Candidate); err != nil {
+				p.write(ctx, signalMsg{Type: "error", Code: "pending-ice-limit", Error: err.Error()})
+			}
 			return
 		}
 		if err := subPC.AddICECandidate(*msg.Candidate); err != nil {
@@ -2518,18 +3464,82 @@ func (s *server) handleTrickle(ctx context.Context, p *peer, msg signalMsg) {
 	}
 }
 
-func (s *server) queueCandidate(p *peer, target string, generation uint64, c webrtc.ICECandidateInit) {
-	if strings.TrimSpace(c.Candidate) == "" {
+func pendingCandidateRetainedBytes(c webrtc.ICECandidateInit) int64 {
+	retained := int64(len(c.Candidate) + 64)
+	if c.SDPMid != nil {
+		retained += int64(len(*c.SDPMid))
+	}
+	if c.UsernameFragment != nil {
+		retained += int64(len(*c.UsernameFragment))
+	}
+	return retained
+}
+
+func (s *server) reservePendingICEBytes(retained int64) bool {
+	if s == nil || retained <= 0 {
+		return false
+	}
+	limit := s.effectiveLimits().PendingICEBytesTotal
+	for {
+		current := s.pendingICEBytes.Load()
+		if current > limit-retained {
+			return false
+		}
+		if s.pendingICEBytes.CompareAndSwap(current, current+retained) {
+			return true
+		}
+	}
+}
+
+func (s *server) releasePendingICEBytes(retained int64) {
+	if s == nil || retained <= 0 {
 		return
 	}
+	for {
+		current := s.pendingICEBytes.Load()
+		next := current - retained
+		if next < 0 {
+			next = 0
+		}
+		if s.pendingICEBytes.CompareAndSwap(current, next) {
+			return
+		}
+	}
+}
 
+func (s *server) queueCandidate(p *peer, target string, generation uint64, c webrtc.ICECandidateInit) error {
+	if strings.TrimSpace(c.Candidate) == "" {
+		return nil
+	}
+	if p == nil || p.closed.Load() {
+		return fmt.Errorf("peer is closed")
+	}
+	if target != "publish" && target != "subscribe" {
+		return fmt.Errorf("invalid ICE target")
+	}
+
+	retained := pendingCandidateRetainedBytes(c)
 	item := pendingCandidate{
-		generation: generation,
-		candidate:  c,
+		generation:    generation,
+		candidate:     c,
+		retainedBytes: retained,
 	}
 
 	p.candMu.Lock()
 	defer p.candMu.Unlock()
+	if p.closed.Load() {
+		return fmt.Errorf("peer is closed")
+	}
+	limits := s.effectiveLimits()
+	if p.pendingCandidateCount >= limits.PendingICECandidatesPerPeer {
+		return fmt.Errorf("too many pending ICE candidates")
+	}
+	if p.pendingCandidateBytes > limits.PendingICEBytesPerPeer-retained {
+		return fmt.Errorf("pending ICE byte allowance exceeded")
+	}
+	if !s.reservePendingICEBytes(retained) {
+		return fmt.Errorf("relay pending ICE byte allowance exceeded")
+	}
 
 	switch target {
 	case "publish":
@@ -2537,25 +3547,47 @@ func (s *server) queueCandidate(p *peer, target string, generation uint64, c web
 	case "subscribe":
 		p.pendingSubCandidates = append(p.pendingSubCandidates, item)
 	}
+	p.pendingCandidateCount++
+	p.pendingCandidateBytes += retained
+	return nil
 }
 
-func (s *server) flushPendingCandidates(p *peer, target string) {
+func (s *server) takePendingCandidates(p *peer, target string) []pendingCandidate {
+	if p == nil {
+		return nil
+	}
 	p.candMu.Lock()
 	var pending []pendingCandidate
 	switch target {
 	case "publish":
-		pending = append(pending, p.pendingPubCandidates...)
+		pending = p.pendingPubCandidates
 		p.pendingPubCandidates = nil
 	case "subscribe":
-		pending = append(pending, p.pendingSubCandidates...)
+		pending = p.pendingSubCandidates
 		p.pendingSubCandidates = nil
 	}
-	p.candMu.Unlock()
-
-	if len(pending) == 0 {
-		return
+	var released int64
+	for _, item := range pending {
+		released += item.retainedBytes
 	}
+	p.pendingCandidateCount -= len(pending)
+	p.pendingCandidateBytes -= released
+	if p.pendingCandidateCount < 0 {
+		p.pendingCandidateCount = 0
+	}
+	if p.pendingCandidateBytes < 0 {
+		p.pendingCandidateBytes = 0
+	}
+	p.candMu.Unlock()
+	s.releasePendingICEBytes(released)
+	return pending
+}
 
+func (s *server) clearPendingCandidates(p *peer, target string) {
+	_ = s.takePendingCandidates(p, target)
+}
+
+func (s *server) flushPendingCandidates(p *peer, target string) {
 	var pc *webrtc.PeerConnection
 	var currentGeneration uint64
 	if target == "publish" {
@@ -2564,15 +3596,13 @@ func (s *server) flushPendingCandidates(p *peer, target string) {
 		pc = p.getSubPC()
 		currentGeneration = p.subGeneration.Load()
 	}
-
 	if pc == nil || pc.RemoteDescription() == nil {
-		p.candMu.Lock()
-		if target == "publish" {
-			p.pendingPubCandidates = append(pending, p.pendingPubCandidates...)
-		} else {
-			p.pendingSubCandidates = append(pending, p.pendingSubCandidates...)
-		}
-		p.candMu.Unlock()
+		return
+	}
+
+	pending := s.takePendingCandidates(p, target)
+
+	if len(pending) == 0 {
 		return
 	}
 
@@ -2582,13 +3612,13 @@ func (s *server) flushPendingCandidates(p *peer, target string) {
 		}
 
 		if target == "publish" && !p.isPubPC(pc) {
-			s.queueCandidate(p, target, item.generation, item.candidate)
+			_ = s.queueCandidate(p, target, item.generation, item.candidate)
 			continue
 		}
 
 		if target == "subscribe" {
 			if !p.isSubPC(pc) {
-				s.queueCandidate(p, target, item.generation, item.candidate)
+				_ = s.queueCandidate(p, target, item.generation, item.candidate)
 				continue
 			}
 			if item.generation == 0 || item.generation != currentGeneration {
@@ -3239,8 +4269,13 @@ func (s *server) detachPeer(p *peer, reason string) {
 
 	p.detachOnce.Do(func() {
 		p.closed.Store(true)
+		s.releasePreJoin(p)
+		s.clearPendingCandidates(p, "publish")
+		s.clearPendingCandidates(p, "subscribe")
+		s.releasePeerCapacity(p)
 		p.stopAllDisconnectTimers()
 		p.stopSubNegotiationTimer()
+		p.stopLobbySnapshotTimer()
 		p.handRaised.Store(false)
 		p.audioEnabled.Store(false)
 		p.videoEnabled.Store(false)
@@ -3267,12 +4302,15 @@ func (s *server) detachPeer(p *peer, reason string) {
 		var ownerPubs []*publication
 		var remainingPeers []*peer
 		wasPending := false
+		var lobbyRevision uint64
 
 		room.mu.Lock()
 
 		if _, ok := room.pending[p.id]; ok {
 			delete(room.pending, p.id)
 			wasPending = true
+			room.lobbyRevision++
+			lobbyRevision = room.lobbyRevision
 		}
 
 		p.subsMu.Lock()
@@ -3330,8 +4368,9 @@ func (s *server) detachPeer(p *peer, reason string) {
 		log.Printf("peer detached: peer=%s room=%s pending=%t reason=%s", p.id, room.name, wasPending, reason)
 		if !wasPending {
 			s.broadcastRoom(room, signalMsg{Type: "peer-left", PeerID: p.id, Username: p.username, Role: role}, nil)
+		} else {
+			s.broadcastLobbyPeerRemoved(room, p, lobbyRevision)
 		}
-		s.broadcastLobbyState(room)
 		p.clearRoom()
 	})
 }
@@ -3366,17 +4405,33 @@ func (s *server) broadcastRoom(r *room, msg signalMsg, skip *peer) {
 	}
 }
 
-func (s *server) broadcastPeerPing(p *peer) {
+func (s *server) handlePingReport(p *peer, rtt int64) {
 	r, ok := p.activeRoom()
-	if !ok {
+	if !ok || rtt < 0 {
 		return
 	}
-	msg := signalMsg{Type: "peer-ping", PeerID: p.id, RTT: p.pingMs.Load()}
-	s.broadcastRoom(r, msg, nil)
+
+	p.stateChangeMu.Lock()
+	if p.pingMs.Load() == rtt || !p.allowBroadcastStateChange(time.Now()) {
+		p.stateChangeMu.Unlock()
+		return
+	}
+	p.pingMs.Store(rtt)
+	p.stateChangeMu.Unlock()
+
+	// Ping reports share the media/moderation budget, so alternating message
+	// types cannot restore unbounded fan-out. The sender already knows its RTT.
+	s.broadcastRoom(r, signalMsg{Type: "peer-ping", PeerID: p.id, RTT: rtt}, p)
 }
 
 func (p *peer) write(ctx context.Context, v any) {
-	if p == nil || p.ws == nil || p.closed.Load() {
+	if p == nil || p.closed.Load() {
+		return
+	}
+	if p.writeHook != nil {
+		p.writeHook(v)
+	}
+	if p.ws == nil {
 		return
 	}
 	if ctx == nil {
@@ -3405,6 +4460,28 @@ func mustGenerateModeratorKey() string {
 		panic(fmt.Sprintf("generate moderator key: %v", err))
 	}
 	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func mustGenerateRoomInstance() string {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("generate room instance: %v", err))
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func isValidRoomInstance(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > maxRoomInstanceLen {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func mustGenerateReconnectToken() string {
@@ -3603,8 +4680,12 @@ func safeRoomName(p *peer) string {
 
 func hWithCORS(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/admin/") {
+			h.ServeHTTP(w, r)
+			return
+		}
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, "+adminTokenHeader)
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -3614,18 +4695,14 @@ func hWithCORS(h http.Handler) http.Handler {
 	})
 }
 
-func readAdminTokenFromConfig(argToken string, argTokenFile string) string {
-	adminToken := strings.TrimSpace(argToken)
-	if adminToken == "" {
-		adminToken = strings.TrimSpace(os.Getenv("RELAY_ADMIN_TOKEN"))
-	}
-
+func readAdminTokenFromConfig(argTokenFile string) string {
 	adminTokenFile := strings.TrimSpace(argTokenFile)
 	if adminTokenFile == "" {
 		adminTokenFile = strings.TrimSpace(os.Getenv("RELAY_ADMIN_TOKEN_FILE"))
 	}
 
-	if adminToken == "" && adminTokenFile != "" {
+	adminToken := ""
+	if adminTokenFile != "" {
 		b, err := os.ReadFile(adminTokenFile)
 		if err != nil {
 			log.Fatalf("read admin token file: %v", err)
@@ -3634,7 +4711,7 @@ func readAdminTokenFromConfig(argToken string, argTokenFile string) string {
 	}
 
 	if adminToken == "" {
-		log.Fatalf("admin token is required: use --admin-token-file, --admin-token, RELAY_ADMIN_TOKEN_FILE, or RELAY_ADMIN_TOKEN")
+		log.Fatalf("admin token is required: use --admin-token-file or RELAY_ADMIN_TOKEN_FILE")
 	}
 
 	return adminToken
@@ -3660,28 +4737,107 @@ func envUint16OrDefault(name string, fallback uint16) uint16 {
 	return uint16(n)
 }
 
+func envIntOrDefault(name string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Fatalf("invalid %s: %q", name, raw)
+	}
+	return n
+}
+
+func envInt64OrDefault(name string, fallback int64) int64 {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		log.Fatalf("invalid %s: %q", name, raw)
+	}
+	return n
+}
+
+func envDurationOrDefault(name string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	duration, err := time.ParseDuration(raw)
+	if err != nil {
+		log.Fatalf("invalid %s: %q", name, raw)
+	}
+	return duration
+}
+
+func validateRelayLimits(limits relayLimits) error {
+	checks := []struct {
+		name    string
+		value   int64
+		minimum int64
+		maximum int64
+	}{
+		{"max-active-peers", int64(limits.MaxActivePeers), 1, 100000},
+		{"max-pending-lobby-peers", int64(limits.MaxPendingLobbyPeers), 1, 100000},
+		{"pending-ice-candidates-per-peer", int64(limits.PendingICECandidatesPerPeer), 1, 4096},
+		{"pending-ice-bytes-per-peer", limits.PendingICEBytesPerPeer, 4096, 64 * 1024 * 1024},
+		{"pending-ice-bytes-total", limits.PendingICEBytesTotal, 4096, 64 * 1024 * 1024 * 1024},
+		{"join-rate-per-minute", int64(limits.JoinRatePerMinute), 1, 10000},
+		{"max-concurrent-joins", int64(limits.MaxConcurrentJoins), 1, 10000},
+		{"max-pre-join-connections", int64(limits.MaxPreJoinConnections), 1, 100000},
+		{"max-pre-join-connections-per-ip", int64(limits.MaxPreJoinConnectionsPerIP), 1, 100000},
+	}
+	for _, check := range checks {
+		if check.value < check.minimum || check.value > check.maximum {
+			return fmt.Errorf("%s must be between %d and %d", check.name, check.minimum, check.maximum)
+		}
+	}
+	if limits.MaxPendingLobbyPeers == limits.MaxActivePeers {
+		return fmt.Errorf("max-pending-lobby-peers must be configured independently from max-active-peers")
+	}
+	if limits.MaxPreJoinConnectionsPerIP > limits.MaxPreJoinConnections {
+		return fmt.Errorf("max-pre-join-connections-per-ip cannot exceed max-pre-join-connections")
+	}
+	if limits.PreJoinTimeout < time.Second || limits.PreJoinTimeout > 5*time.Minute {
+		return fmt.Errorf("pre-join-timeout must be between 1s and 5m")
+	}
+	return nil
+}
+
 func main() {
 	var (
-		addr              = flag.String("addr", ":3001", "public HTTP listen address, e.g. :3001")
-		instanceNameArg   = flag.String("instance-name", envOrDefault("RELAY_INSTANCE_NAME", "relay"), "instance name returned by the admin version endpoint")
-		adminAddr         = flag.String("admin-addr", envOrDefault("RELAY_ADMIN_ADDR", "127.0.0.1:3002"), "admin HTTP listen address for /admin/* endpoints")
-		adminOnPublic     = flag.Bool("admin-on-public", false, "also expose /admin/* on the public listener; not recommended unless protected by a reverse proxy")
-		publicBaseURLArg  = flag.String("public-base-url", "", "public base URL used in admin link responses, e.g. https://example.com")
-		wsPath            = flag.String("ws", "/ws", "WebSocket path")
-		publicIPArg       = flag.String("public-ip", "", "public server IP used for NAT 1:1 host candidates")
-		dbPathArg         = flag.String("rooms-db", "", "path to sqlite database for open rooms")
-		dbTableArg        = flag.String("db-table", envOrDefault("RELAY_DB_TABLE", "records"), "sqlite table name")
-		dbRoomColumnArg   = flag.String("db-room-column", envOrDefault("RELAY_DB_ROOM_COLUMN", "entry_id"), "sqlite room column name")
-		dbKeyColumnArg    = flag.String("db-key-column", envOrDefault("RELAY_DB_KEY_COLUMN", "entry_value"), "sqlite moderator key column name")
-		adminTokenArg     = flag.String("admin-token", "", "admin API token for /admin/* endpoints")
-		adminTokenFileArg = flag.String("admin-token-file", "", "path to file containing admin API token for /admin/* endpoints")
-		tlsCertArg        = flag.String("tls-cert", "", "TLS certificate path for the public listener")
-		tlsKeyArg         = flag.String("tls-key", "", "TLS private key path for the public listener")
-		iceUDPPortMinArg  = flag.Uint("ice-udp-port-min", uint(envUint16OrDefault("RELAY_ICE_UDP_PORT_MIN", 32768)), "minimum UDP port for WebRTC ICE media")
-		iceUDPPortMaxArg  = flag.Uint("ice-udp-port-max", uint(envUint16OrDefault("RELAY_ICE_UDP_PORT_MAX", 60999)), "maximum UDP port for WebRTC ICE media")
-		includeLoop       = flag.Bool("loopback", false, "include loopback host candidates")
-		allowPrivateICE   = flag.Bool("allow-private-ice", false, "advertise private host candidates; use only for LAN or test environments")
-		nat1to1CSV        = flag.String("nat1to1", "", "comma-separated external IPs for 1:1 NAT mapping")
+		addr                           = flag.String("addr", ":3001", "public HTTP listen address, e.g. :3001")
+		instanceNameArg                = flag.String("instance-name", envOrDefault("RELAY_INSTANCE_NAME", "relay"), "instance name returned by the admin version endpoint")
+		adminAddr                      = flag.String("admin-addr", envOrDefault("RELAY_ADMIN_ADDR", "127.0.0.1:3002"), "admin HTTP listen address for /admin/* endpoints")
+		adminOnPublic                  = flag.Bool("admin-on-public", true, "expose authenticated /admin/* endpoints on the public listener for remote app administration")
+		wsPath                         = flag.String("ws", "/ws", "WebSocket path")
+		publicIPArg                    = flag.String("public-ip", "", "public server IP used for NAT 1:1 host candidates")
+		dbPathArg                      = flag.String("rooms-db", "", "path to sqlite database for open rooms")
+		dbTableArg                     = flag.String("db-table", envOrDefault("RELAY_DB_TABLE", "records"), "sqlite table name")
+		dbRoomColumnArg                = flag.String("db-room-column", envOrDefault("RELAY_DB_ROOM_COLUMN", "entry_id"), "sqlite room column name")
+		dbKeyColumnArg                 = flag.String("db-key-column", envOrDefault("RELAY_DB_KEY_COLUMN", "entry_value"), "sqlite moderator key column name")
+		adminTokenFileArg              = flag.String("admin-token-file", "", "path to file containing admin API token for /admin/* endpoints")
+		moderatorKeyFileArg            = flag.String("moderator-key-encryption-key-file", "", "path to a 32-byte key file used to encrypt moderator keys in SQLite")
+		tlsCertArg                     = flag.String("tls-cert", "", "TLS certificate path for the public listener")
+		tlsKeyArg                      = flag.String("tls-key", "", "TLS private key path for the public listener")
+		iceUDPPortMinArg               = flag.Uint("ice-udp-port-min", uint(envUint16OrDefault("RELAY_ICE_UDP_PORT_MIN", 32768)), "minimum UDP port for WebRTC ICE media")
+		iceUDPPortMaxArg               = flag.Uint("ice-udp-port-max", uint(envUint16OrDefault("RELAY_ICE_UDP_PORT_MAX", 60999)), "maximum UDP port for WebRTC ICE media")
+		maxActivePeersArg              = flag.Int("max-active-peers", envIntOrDefault("RELAY_MAX_ACTIVE_PEERS", defaultMaxActivePeers), "maximum active peers across the relay")
+		maxPendingLobbyPeersArg        = flag.Int("max-pending-lobby-peers", envIntOrDefault("RELAY_MAX_PENDING_LOBBY_PEERS", defaultMaxPendingLobbyPeers), "maximum pending lobby peers across the relay")
+		pendingICECandidatesPerPeerArg = flag.Int("pending-ice-candidates-per-peer", envIntOrDefault("RELAY_PENDING_ICE_CANDIDATES_PER_PEER", defaultPendingICECandidatesPerPeer), "maximum queued ICE candidates per peer across publish and subscribe")
+		pendingICEBytesPerPeerArg      = flag.Int64("pending-ice-bytes-per-peer", envInt64OrDefault("RELAY_PENDING_ICE_BYTES_PER_PEER", defaultPendingICEBytesPerPeer), "maximum queued ICE retained bytes per peer")
+		pendingICEBytesTotalArg        = flag.Int64("pending-ice-bytes-total", envInt64OrDefault("RELAY_PENDING_ICE_BYTES_TOTAL", defaultPendingICEBytesTotal), "relay-wide queued ICE retained byte budget")
+		joinRatePerMinuteArg           = flag.Int("join-rate-per-minute", envIntOrDefault("RELAY_JOIN_RATE_PER_MINUTE", defaultJoinRatePerMinute), "maximum join attempts per WebSocket connection per minute")
+		maxConcurrentJoinsArg          = flag.Int("max-concurrent-joins", envIntOrDefault("RELAY_MAX_CONCURRENT_JOINS", defaultMaxConcurrentJoins), "maximum joins processed concurrently")
+		maxPreJoinConnectionsArg       = flag.Int("max-pre-join-connections", envIntOrDefault("RELAY_MAX_PRE_JOIN_CONNECTIONS", defaultMaxPreJoinConnections), "maximum WebSocket connections that have not completed join")
+		maxPreJoinConnectionsPerIPArg  = flag.Int("max-pre-join-connections-per-ip", envIntOrDefault("RELAY_MAX_PRE_JOIN_CONNECTIONS_PER_IP", defaultMaxPreJoinConnectionsPerIP), "maximum pre-join WebSocket connections per source IP")
+		preJoinTimeoutArg              = flag.Duration("pre-join-timeout", envDurationOrDefault("RELAY_PRE_JOIN_TIMEOUT", defaultPreJoinTimeout), "maximum time allowed to complete a valid join")
+		includeLoop                    = flag.Bool("loopback", false, "include loopback host candidates")
+		allowPrivateICE                = flag.Bool("allow-private-ice", false, "advertise private host candidates; use only for LAN or test environments")
+		nat1to1CSV                     = flag.String("nat1to1", "", "comma-separated external IPs for 1:1 NAT mapping")
 	)
 	flag.Parse()
 
@@ -3692,6 +4848,21 @@ func main() {
 	}
 	iceUDPPortMin := uint16(*iceUDPPortMinArg)
 	iceUDPPortMax := uint16(*iceUDPPortMaxArg)
+	limits := relayLimits{
+		MaxActivePeers:              *maxActivePeersArg,
+		MaxPendingLobbyPeers:        *maxPendingLobbyPeersArg,
+		PendingICECandidatesPerPeer: *pendingICECandidatesPerPeerArg,
+		PendingICEBytesPerPeer:      *pendingICEBytesPerPeerArg,
+		PendingICEBytesTotal:        *pendingICEBytesTotalArg,
+		JoinRatePerMinute:           *joinRatePerMinuteArg,
+		MaxConcurrentJoins:          *maxConcurrentJoinsArg,
+		MaxPreJoinConnections:       *maxPreJoinConnectionsArg,
+		MaxPreJoinConnectionsPerIP:  *maxPreJoinConnectionsPerIPArg,
+		PreJoinTimeout:              *preJoinTimeoutArg,
+	}
+	if err := validateRelayLimits(limits); err != nil {
+		log.Fatalf("invalid relay limits: %v", err)
+	}
 
 	publicIP := strings.TrimSpace(*publicIPArg)
 	if publicIP == "" {
@@ -3713,13 +4884,25 @@ func main() {
 		dbPath = "records.db"
 	}
 
-	adminToken := readAdminTokenFromConfig(*adminTokenArg, *adminTokenFileArg)
-
-	publicBaseURL := strings.TrimSpace(*publicBaseURLArg)
-	if publicBaseURL == "" {
-		publicBaseURL = strings.TrimSpace(os.Getenv("RELAY_PUBLIC_BASE_URL"))
+	adminToken := readAdminTokenFromConfig(*adminTokenFileArg)
+	moderatorKeyFile := strings.TrimSpace(*moderatorKeyFileArg)
+	if moderatorKeyFile == "" {
+		moderatorKeyFile = strings.TrimSpace(os.Getenv("RELAY_MODERATOR_KEY_ENCRYPTION_KEY_FILE"))
 	}
-	publicBaseURL = strings.TrimRight(publicBaseURL, "/")
+	if moderatorKeyFile == "" {
+		moderatorKeyFile = dbPath + ".moderator-key"
+	}
+	moderatorKeyMaterial, err := loadOrCreateModeratorKeyEncryptionKey(moderatorKeyFile)
+	if err != nil {
+		log.Fatalf("load moderator key encryption key: %v", err)
+	}
+	moderatorKeys, err := newModeratorKeyCipher(moderatorKeyMaterial)
+	for i := range moderatorKeyMaterial {
+		moderatorKeyMaterial[i] = 0
+	}
+	if err != nil {
+		log.Fatalf("configure moderator key encryption: %v", err)
+	}
 
 	if len(iceURLs) == 0 {
 		log.Printf("Using host-only SFU ICE config. No default SFU-side TURN. Clients may still enforce relay-only.")
@@ -3732,16 +4915,14 @@ func main() {
 	if publicIP != "" {
 		log.Printf("Public IP: %s", publicIP)
 	}
-	if publicBaseURL != "" {
-		log.Printf("Public base URL: %s", publicBaseURL)
-	}
 	if *allowPrivateICE {
 		log.Printf("WARNING: private ICE candidates are enabled for LAN/test use")
 	}
 	log.Printf("ICE UDP port range: %d-%d/udp", iceUDPPortMin, iceUDPPortMax)
 	log.Printf("Admin API token configured: yes")
+	log.Printf("Relay limits: active=%d pendingLobby=%d pendingICECandidatesPerPeer=%d pendingICEBytesPerPeer=%d pendingICEBytesTotal=%d joinRatePerMinute=%d concurrentJoins=%d preJoin=%d preJoinPerIP=%d preJoinTimeout=%s", limits.MaxActivePeers, limits.MaxPendingLobbyPeers, limits.PendingICECandidatesPerPeer, limits.PendingICEBytesPerPeer, limits.PendingICEBytesTotal, limits.JoinRatePerMinute, limits.MaxConcurrentJoins, limits.MaxPreJoinConnections, limits.MaxPreJoinConnectionsPerIP, limits.PreJoinTimeout)
 
-	s := newServer(iceURLs, *includeLoop, *allowPrivateICE, natIPs, publicIP, dbPath, *dbTableArg, *dbRoomColumnArg, *dbKeyColumnArg, adminToken, publicBaseURL, *instanceNameArg, iceUDPPortMin, iceUDPPortMax)
+	s := newServer(iceURLs, *includeLoop, *allowPrivateICE, natIPs, publicIP, dbPath, *dbTableArg, *dbRoomColumnArg, *dbKeyColumnArg, adminToken, *instanceNameArg, iceUDPPortMin, iceUDPPortMax, limits, moderatorKeys)
 
 	publicMux := http.NewServeMux()
 	publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -3749,14 +4930,14 @@ func main() {
 		fmt.Fprintf(w, "Service is running. WebSocket endpoint: %s\n", *wsPath)
 	})
 	publicMux.HandleFunc(*wsPath, s.wsHandler)
-	publicMux.HandleFunc("/connect", s.connectRedirectHandler)
 	if *adminOnPublic {
-		log.Printf("WARNING: /admin/* is exposed on the public listener because --admin-on-public=true")
+		log.Printf("Authenticated /admin/* API is exposed on the public listener")
 		publicMux.HandleFunc("/admin/version", s.adminVersionHandler)
 		publicMux.HandleFunc("/admin/open-room", s.adminOpenRoomHandler)
 		publicMux.HandleFunc("/admin/close-room", s.adminCloseRoomHandler)
 		publicMux.HandleFunc("/admin/open-rooms", s.adminOpenRoomsHandler)
 		publicMux.HandleFunc("/admin/rotate-moderator-key", s.adminRotateModeratorKeyHandler)
+		publicMux.HandleFunc("/admin/room-settings", s.adminRoomSettingsHandler)
 	}
 
 	adminMux := http.NewServeMux()
@@ -3765,6 +4946,7 @@ func main() {
 	adminMux.HandleFunc("/admin/close-room", s.adminCloseRoomHandler)
 	adminMux.HandleFunc("/admin/open-rooms", s.adminOpenRoomsHandler)
 	adminMux.HandleFunc("/admin/rotate-moderator-key", s.adminRotateModeratorKeyHandler)
+	adminMux.HandleFunc("/admin/room-settings", s.adminRoomSettingsHandler)
 
 	adminServer := &http.Server{
 		Addr:              *adminAddr,

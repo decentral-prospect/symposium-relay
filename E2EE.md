@@ -1,13 +1,15 @@
 # Relay behavior with media E2EE
 
-Symposium Relay is intentionally not a key endpoint. Production signaling has no
+SymposiumRelay is intentionally not a key endpoint. Production signaling has no
 conference media-key field, the relay does not derive or store frame keys, and it
 does not decrypt media. It forwards RTP packets so Android endpoints can apply
 and verify `frame-aes-gcm-v1` themselves.
 
-The room secret is distributed in an invitation URL fragment (`#e2ee=...`). A
-fragment is handled locally by the browser/Android client and is never included
-in the HTTP request or WebSocket join message. The relay still sees the metadata
+The room secret is distributed in an opaque `SPT1` invitation token. The Android
+client decodes it locally; the token and media secret are never included in an
+HTTP request or WebSocket join message. This token is a bearer credential, not
+a way to hide its contents from its recipient, and must be shared privately.
+The relay still sees the metadata
 needed to run an SFU: participant network addresses, room membership, track type,
 SSRC/RTP routing data, packet sizes, and timing.
 
