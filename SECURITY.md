@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Symposium Relay is under active development.
+SymposiumRelay is under active development.
 
 | Version               | Supported   |
 | --------------------- | ----------- |
@@ -25,7 +25,7 @@ Use GitHub Private Vulnerability Reporting for this repository:
 
 Useful information includes:
 
-* affected Symposium Relay version or commit;
+* affected SymposiumRelay version or commit;
 * vulnerability description;
 * steps to reproduce;
 * expected and actual behavior;
@@ -65,7 +65,7 @@ Once a fix is available, we may publish a GitHub Security Advisory describing th
 
 ## Scope
 
-Security reports relevant to Symposium Relay include, but are not limited to:
+Security reports relevant to SymposiumRelay include, but are not limited to:
 
 * authentication or authorization bypasses;
 * moderator privilege escalation;
@@ -83,8 +83,8 @@ General bugs, feature requests, usability problems, and non-security crashes sho
 
 ## Good-Faith Research
 
-We welcome responsible, good-faith security research intended to improve Symposium Relay.
+We welcome responsible, good-faith security research intended to improve SymposiumRelay.
 
 Please minimize privacy impact, data access, service disruption, and harm to users while conducting research.
 
-Thank you for helping improve the security of Symposium Relay.
+Thank you for helping improve the security of SymposiumRelay.

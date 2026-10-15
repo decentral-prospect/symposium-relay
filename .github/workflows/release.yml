@@ -123,7 +123,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --verify-tag \
             --generate-notes \
-            --title "Symposium Server ${GITHUB_REF_NAME}" \
+            --title "SymposiumRelay ${GITHUB_REF_NAME}" \
             --draft
 
       - name: Upload release assets

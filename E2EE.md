@@ -1,6 +1,6 @@
 # Relay behavior with media E2EE
 
-Symposium Relay is intentionally not a key endpoint. Production signaling has no
+SymposiumRelay is intentionally not a key endpoint. Production signaling has no
 conference media-key field, the relay does not derive or store frame keys, and it
 does not decrypt media. It forwards RTP packets so Android endpoints can apply
 and verify `frame-aes-gcm-v1` themselves.
