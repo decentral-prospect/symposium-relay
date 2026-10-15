@@ -26,11 +26,12 @@ func TestAndroidClientMediaE2EPeer(t *testing.T) {
 
 	wsURL := strings.TrimSpace(os.Getenv("SYMPOSIUM_ANDROID_E2E_WS_URL"))
 	room := strings.TrimSpace(os.Getenv("SYMPOSIUM_ANDROID_E2E_ROOM"))
+	roomInstance := strings.TrimSpace(os.Getenv("SYMPOSIUM_ANDROID_E2E_ROOM_INSTANCE"))
 	moderatorKey := strings.TrimSpace(os.Getenv("SYMPOSIUM_ANDROID_E2E_MODERATOR_KEY"))
 	e2eeSecret := strings.TrimSpace(os.Getenv("SYMPOSIUM_ANDROID_E2E_SECRET"))
 	requireOutboundAudio := strings.TrimSpace(os.Getenv("SYMPOSIUM_ANDROID_E2E_REQUIRE_OUTBOUND_AUDIO")) != "false"
-	if wsURL == "" || room == "" || moderatorKey == "" || e2eeSecret == "" {
-		t.Fatal("Android E2E host peer requires websocket URL, room, moderator key, and E2EE secret")
+	if wsURL == "" || room == "" || roomInstance == "" || moderatorKey == "" || e2eeSecret == "" {
+		t.Fatal("Android E2E host peer requires websocket URL, room instance, moderator key, and E2EE secret")
 	}
 	frameCryptor, err := newTestFrameCryptor(e2eeSecret)
 	if err != nil {
@@ -50,7 +51,7 @@ func TestAndroidClientMediaE2EPeer(t *testing.T) {
 	peer.frameCryptor = frameCryptor
 	t.Cleanup(peer.close)
 
-	peer.joinRoom(t, room, moderatorKey, "host-media-peer")
+	peer.joinRoom(t, room, roomInstance, moderatorKey, "host-media-peer")
 	peer.waitForJoin(t)
 	stopMedia := peer.startPublishing(t)
 	t.Cleanup(stopMedia)
@@ -71,6 +72,7 @@ func TestAndroidClientMediaE2EPeer(t *testing.T) {
 		case receipt := <-peer.received:
 			if requiredKinds[receipt.kind] {
 				received[receipt.kind] = receipt
+				fmt.Printf("ANDROID_MEDIA_E2E_AUTHENTICATED kind=%s frames=%d\n", receipt.kind, receipt.authenticatedFrames)
 			}
 		case err := <-peer.errs:
 			t.Fatalf("Android E2E host peer failed: %v", err)

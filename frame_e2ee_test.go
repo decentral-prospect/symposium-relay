@@ -13,6 +13,9 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
+	"github.com/pion/webrtc/v4/pkg/media/samplebuilder"
 	"golang.org/x/crypto/pbkdf2"
 )
 
@@ -24,6 +27,10 @@ const (
 )
 
 var testFrameE2EERatchetSalt = []byte("SymposiumFrameEncryptionKey/v1")
+
+func newE2EVideoSampleBuilder() *samplebuilder.SampleBuilder {
+	return samplebuilder.New(128, &codecs.VP8Packet{}, 90000)
+}
 
 // testFrameCryptor implements the wire format used by the Android WebRTC
 // FrameCryptor. It exists only in tests so the host peer can authenticate and
@@ -170,5 +177,85 @@ func TestFrameE2EEWireFormatRejectsTampering(t *testing.T) {
 	tampered[4] ^= 0x80
 	if _, err := cryptor.decryptFrame(tampered, 3); err == nil {
 		t.Fatal("tampered ciphertext was accepted")
+	}
+}
+
+func TestE2EVideoAssemblyAuthenticatesCompleteFrames(t *testing.T) {
+	cryptor, err := newTestFrameCryptor(base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := append([]byte{0x11, 0, 0}, bytes.Repeat([]byte{0x42}, 1024)...)
+	encrypted, err := cryptor.encryptFrame(plain, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fragments := (&codecs.VP8Payloader{}).Payload(120, encrypted)
+	for _, scenario := range []string{"ordered", "join-mid-frame", "missing-fragment", "reordered", "duplicate", "sequence-wrap", "tampered"} {
+		t.Run(scenario, func(t *testing.T) {
+			builder := newE2EVideoSampleBuilder()
+			var packets []*rtp.Packet
+			sequence := uint16(100)
+			if scenario == "sequence-wrap" {
+				sequence = 65532
+			}
+			frameCount := 2
+			if scenario == "missing-fragment" {
+				// Keep the stream flowing beyond the reorder window so a lost
+				// packet expires and subsequent complete frames can be emitted.
+				frameCount = 20
+			}
+			for frame := 0; frame < frameCount; frame++ {
+				for i, fragment := range fragments {
+					packet := &rtp.Packet{Header: rtp.Header{
+						Version: 2, SequenceNumber: sequence, Timestamp: uint32(3000 * (frame + 1)), Marker: i == len(fragments)-1,
+					}, Payload: append([]byte(nil), fragment...)}
+					sequence++
+					if frame == 0 && ((scenario == "join-mid-frame" && i == 0) || (scenario == "missing-fragment" && i == 2)) {
+						continue
+					}
+					if scenario == "tampered" && frame == 0 && i == 2 {
+						packet.Payload[2] ^= 0x80
+					}
+					packets = append(packets, packet)
+					if scenario == "duplicate" {
+						packets = append(packets, packet.Clone())
+					}
+				}
+			}
+			if scenario == "reordered" {
+				packets[1], packets[2] = packets[2], packets[1]
+			}
+			authenticated, rejected := 0, 0
+			drain := func() {
+				for sample := builder.Pop(); sample != nil; sample = builder.Pop() {
+					decoded, err := cryptor.decryptFrame(sample.Data, 3)
+					if err != nil {
+						rejected++
+						continue
+					}
+					if !bytes.Equal(decoded, plain) {
+						t.Fatal("assembled frame differs from the authenticated original")
+					}
+					authenticated++
+				}
+			}
+			for _, packet := range packets {
+				builder.Push(packet)
+				drain()
+			}
+			builder.Flush()
+			drain()
+			wantAuthenticated, wantRejected := frameCount, 0
+			if scenario == "join-mid-frame" || scenario == "missing-fragment" || scenario == "tampered" {
+				wantAuthenticated--
+			}
+			if scenario == "tampered" {
+				wantRejected = 1
+			}
+			if authenticated != wantAuthenticated || rejected != wantRejected {
+				t.Fatalf("authenticated=%d rejected=%d; want %d and %d", authenticated, rejected, wantAuthenticated, wantRejected)
+			}
+		})
 	}
 }

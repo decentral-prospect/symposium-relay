@@ -23,6 +23,7 @@ import (
 
 const (
 	mediaE2ERoom         = "media-e2e"
+	mediaE2ERoomInstance = "media-e2e-instance"
 	mediaE2EModeratorKey = "media-e2e-moderator-key"
 )
 
@@ -83,6 +84,84 @@ func TestLoopbackICECandidatesRequireExplicitOptIn(t *testing.T) {
 	}
 }
 
+func TestWebSocketJoinRejectsClientVersionThatDiffersFromRoom(t *testing.T) {
+	relay := newMediaE2ERelay(t)
+	relay.roomVersions = map[string]string{mediaE2ERoom: "0.3.4"}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", relay.wsHandler)
+	httpServer := httptest.NewServer(mux)
+	t.Cleanup(httpServer.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(httpServer.URL, "http")+"/ws", nil)
+	if err != nil {
+		t.Fatalf("dial relay websocket: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.CloseNow() })
+
+	if err := wsjson.Write(ctx, conn, signalMsg{
+		Type:          "join",
+		Room:          mediaE2ERoom,
+		RoomInstance:  mediaE2ERoomInstance,
+		ClientVersion: "0.3.5",
+	}); err != nil {
+		t.Fatalf("write incompatible join: %v", err)
+	}
+
+	var response signalMsg
+	if err := wsjson.Read(ctx, conn, &response); err != nil {
+		t.Fatalf("read version rejection: %v", err)
+	}
+	if response.Type != "error" || response.Code != "client-version-mismatch" {
+		t.Fatalf("version rejection = %#v", response)
+	}
+	if response.RequiredVersion != "0.3.4" || response.ClientVersion != "0.3.5" {
+		t.Fatalf(
+			"version rejection required/client = %q/%q, want 0.3.4/0.3.5",
+			response.RequiredVersion,
+			response.ClientVersion,
+		)
+	}
+}
+
+func TestWebSocketPreJoinTimeoutClosesIdleConnection(t *testing.T) {
+	relay := newMediaE2ERelay(t)
+	relay.limits.PreJoinTimeout = 75 * time.Millisecond
+	relay.limits.MaxPreJoinConnections = 4
+	relay.limits.MaxPreJoinConnectionsPerIP = 4
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", relay.wsHandler)
+	httpServer := httptest.NewServer(mux)
+	t.Cleanup(httpServer.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(httpServer.URL, "http")+"/ws", nil)
+	if err != nil {
+		t.Fatalf("dial relay websocket: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.CloseNow() })
+
+	var response signalMsg
+	if err := wsjson.Read(ctx, conn, &response); err == nil {
+		t.Fatal("idle pre-join connection remained open")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		relay.preJoinMu.Lock()
+		remaining := relay.preJoinTotal
+		relay.preJoinMu.Unlock()
+		if remaining == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pre-join reservation was not released: %d", remaining)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestMediaTrafficE2EAudioAndVideo(t *testing.T) {
 	relay := newMediaE2ERelay(t)
 	mux := http.NewServeMux()
@@ -139,6 +218,9 @@ func newMediaE2ERelay(t *testing.T) *server {
 		rooms:                      make(map[string]*room),
 		openRooms: map[string]string{
 			mediaE2ERoom: mediaE2EModeratorKey,
+		},
+		roomInstances: map[string]string{
+			mediaE2ERoom: mediaE2ERoomInstance,
 		},
 	}
 }
@@ -215,18 +297,20 @@ func newMediaE2EClientWithDialOptions(t *testing.T, wsURL string, receiveMedia b
 }
 
 func (c *mediaE2EClient) join(t *testing.T, username string) {
-	c.joinRoom(t, mediaE2ERoom, mediaE2EModeratorKey, username)
+	c.joinRoom(t, mediaE2ERoom, mediaE2ERoomInstance, mediaE2EModeratorKey, username)
 }
 
-func (c *mediaE2EClient) joinRoom(t *testing.T, room string, moderatorKey string, username string) {
+func (c *mediaE2EClient) joinRoom(t *testing.T, room string, roomInstance string, moderatorKey string, username string) {
 	t.Helper()
 
 	if err := c.write(signalMsg{
-		Type:     "join",
-		Room:     room,
-		Username: username,
-		ClientID: "media-e2e-" + username,
-		ModKey:   moderatorKey,
+		Type:          "join",
+		Room:          room,
+		RoomInstance:  roomInstance,
+		Username:      username,
+		ClientID:      "media-e2e-" + username,
+		ClientVersion: serverVersion,
+		ModKey:        moderatorKey,
 	}); err != nil {
 		t.Fatalf("join %s: %v", username, err)
 	}
@@ -341,19 +425,24 @@ func (c *mediaE2EClient) readRawRelayedTrack(track *webrtc.TrackRemote) {
 
 func (c *mediaE2EClient) readEncryptedRawRelayedTrack(track *webrtc.TrackRemote) {
 	authenticatedFrames := 0
-	var videoTimestamp uint32
-	var videoFrame []byte
+	videoSamples := newE2EVideoSampleBuilder()
+	buffer := make([]byte, 64*1024)
 
 	for {
-		packet, _, readErr := track.ReadRTP()
+		n, _, readErr := track.Read(buffer)
 		if readErr != nil {
 			if c.ctx.Err() == nil && !c.closed.Load() {
 				c.reportError(fmt.Errorf("read encrypted %s RTP: %w", track.Kind().String(), readErr))
 			}
 			return
 		}
-		timestamp := packet.Timestamp
-		marker := packet.Marker
+		packet := &rtp.Packet{}
+		if err := packet.Unmarshal(buffer[:n]); err != nil {
+			var header rtp.Header
+			headerBytes, _ := header.Unmarshal(buffer[:n])
+			c.reportError(fmt.Errorf("decode encrypted %s RTP: %w (bytes=%d header=%d padding=%t)", track.Kind(), err, n, headerBytes, header.Padding))
+			return
+		}
 		payload := packet.Payload
 
 		if track.Kind() == webrtc.RTPCodecTypeAudio {
@@ -368,19 +457,14 @@ func (c *mediaE2EClient) readEncryptedRawRelayedTrack(track *webrtc.TrackRemote)
 			}
 			authenticatedFrames++
 		} else {
-			codecPayload, descriptorErr := stripVP8PayloadDescriptor(payload)
-			if descriptorErr != nil {
-				c.reportError(fmt.Errorf("parse Android VP8 descriptor: %w", descriptorErr))
-				return
-			}
-			if videoTimestamp != 0 && timestamp != videoTimestamp {
-				videoFrame = videoFrame[:0]
-			}
-			videoTimestamp = timestamp
-			videoFrame = append(videoFrame, codecPayload...)
-			if !marker {
+			// Read reuses buffer, while the sample builder retains packets to
+			// handle reordered RTP and incomplete frames when joining midstream.
+			videoSamples.Push(packet.Clone())
+			sample := videoSamples.Pop()
+			if sample == nil {
 				continue
 			}
+			videoFrame := sample.Data
 			headerBytes, headerErr := vp8ClearHeaderBytes(videoFrame)
 			if headerErr != nil {
 				c.reportError(fmt.Errorf("inspect Android VP8 frame: %w", headerErr))
@@ -397,7 +481,6 @@ func (c *mediaE2EClient) readEncryptedRawRelayedTrack(track *webrtc.TrackRemote)
 			}
 			c.storeEchoVideoFrame(plain)
 			authenticatedFrames++
-			videoFrame = videoFrame[:0]
 		}
 
 		if authenticatedFrames == 5 {
